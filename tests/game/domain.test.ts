@@ -12,6 +12,41 @@ import {
   ARABIC_WORDS,
   ALL_WORDS,
 } from '../../src/features/game/words'
+import {
+  applyCorrectGuess,
+  canJoinRoom,
+  isRoundExpired,
+  normalizeRoom,
+  startRound,
+  type Room,
+} from '../../src/features/room/types'
+
+const player = (id: string, connected = true): Player => ({
+  id,
+  name: id,
+  score: 0,
+  connected,
+})
+
+const makeRoom = (players: Record<string, Player>): Room => ({
+  id: 'ABC123',
+  hostId: 'p1',
+  status: 'lobby',
+  settings: { language: 'english', drawSeconds: 60, rounds: 1, maxPlayers: 10 },
+  players,
+  game: {
+    turnId: null,
+    turnIndex: 0,
+    round: 0,
+    drawerId: null,
+    phaseEndsAt: null,
+    answer: null,
+    answerDigest: null,
+    choices: [],
+    correctGuesserIds: {},
+    awards: {},
+  },
+})
 
 describe('Word Banks', () => {
   it('ships exactly 100 words per language', () => {
@@ -173,5 +208,61 @@ describe('nextDrawerId', () => {
     ]
     expect(nextDrawerId(disconnectedPlayers, 'p1')).toBeNull()
     expect(nextDrawerId([], null)).toBeNull()
+  })
+})
+
+describe('room transitions', () => {
+  it('rejects an eleventh player', () => {
+    const players = Object.fromEntries(
+      Array.from({ length: 10 }, (_, index) => {
+        const id = `p${index + 1}`
+        return [id, player(id)]
+      })
+    )
+
+    expect(canJoinRoom(makeRoom(players), 'new')).toBe(false)
+  })
+
+  it('starts a lobby turn in choosing', () => {
+    const room = makeRoom({ p1: player('p1'), p2: player('p2') })
+
+    expect(startRound(room).status).toBe('choosing')
+  })
+
+  it('ends when all connected guessers are correct', () => {
+    const room = makeRoom({ p1: player('p1'), p2: player('p2') })
+    room.status = 'drawing'
+    room.game.turnId = 'turn-0'
+    room.game.drawerId = 'p1'
+    room.game.answer = ENGLISH_WORDS[0]
+
+    expect(applyCorrectGuess(room, 'p2').status).toBe('results')
+  })
+
+  it('normalizes omitted persisted game collections before a transition', () => {
+    const rawRoom = {
+      ...makeRoom({ p1: player('p1'), p2: player('p2') }),
+      game: { ...makeRoom({}).game, choices: null, correctGuesserIds: null, awards: null },
+      strokes: null,
+    }
+
+    const room = normalizeRoom(rawRoom)
+    expect(room?.game.choices).toEqual([])
+    expect(room?.game.correctGuesserIds).toEqual({})
+    expect(room?.game.awards).toEqual({})
+    expect(room?.strokes).toEqual({})
+    expect(room && startRound(room).status).toBe('choosing')
+  })
+
+  it('rejects a correct guess at the expiration boundary', () => {
+    const room = makeRoom({ p1: player('p1'), p2: player('p2') })
+    room.status = 'drawing'
+    room.game.turnId = 'turn-0'
+    room.game.drawerId = 'p1'
+    room.game.answer = ENGLISH_WORDS[0]
+    room.game.phaseEndsAt = 1_000
+
+    expect(isRoundExpired(room, 1_000)).toBe(true)
+    expect(applyCorrectGuess(room, 'p2', 1_000)).toBe(room)
   })
 })

@@ -34,8 +34,12 @@ Required public environment variables:
 - `npm run build`: Run TypeScript type-checks and compile the static production bundle to `dist/`.
 
 ### 5. Deployment
-Firebase Hosting is configured in `firebase.json` to deploy the static bundle from `dist/`.
+Create a Firebase project, enable **Anonymous** sign-in in Firebase Authentication, and create a
+Realtime Database. Copy its five public web-app configuration values into `.env.local` as shown
+above. Firebase Hosting is configured in `firebase.json` to deploy the static bundle from `dist/`.
+
 ```bash
 npm run build
+firebase deploy --only database
 firebase deploy --only hosting
 ```
