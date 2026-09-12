@@ -115,8 +115,16 @@ export const createRoomRepository = (database: Database) => {
     return { ok: false, reason: 'full' }
   }
 
-  const subscribeToRoom = (roomId: string, onRoom: (room: Room | null) => void): Unsubscribe =>
-    onValue(roomRef(roomId), snapshot => onRoom(normalizeRoom(snapshot.val())))
+  const subscribeToRoom = (
+    roomId: string,
+    onRoom: (room: Room | null) => void,
+    onError?: (error: Error) => void,
+  ): Unsubscribe =>
+    onValue(
+      roomRef(roomId),
+      snapshot => onRoom(normalizeRoom(snapshot.val())),
+      error => onError?.(error),
+    )
 
   const subscribeToRoundSecret = (roomId: string, onSecret: (secret: { answer: Word | null; choices: Word[] }) => void): Unsubscribe =>
     onValue(secretRef(roomId), snapshot => {
