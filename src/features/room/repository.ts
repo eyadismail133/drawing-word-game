@@ -11,8 +11,8 @@ import {
   type Database,
   type Unsubscribe,
 } from 'firebase/database'
-import { isCorrectGuess, scoreGuess, type Player, type Word } from '../game/domain'
-import { canJoinRoom, isRoundExpired, normalizeRoom, startRound, type Room, type RoomSettings, type Stroke } from './types'
+import { formatWordBlanks, isCorrectGuess, scoreGuess, type Player, type Word } from '../game/domain'
+import { canJoinRoom, generateSessionId, isRoundExpired, normalizeRoom, startRound, type Room, type RoomSettings, type Stroke } from './types'
 
 export type JoinRoomResult = { ok: true; room: Room } | { ok: false; reason: 'full' | 'started' | 'missing' }
 export type GuessResult = { correct: boolean; room: Room | null }
@@ -138,6 +138,21 @@ export const createRoomRepository = (database: Database) => {
     return strokeRef.key ?? ''
   }
 
+  const clearCanvas = async (roomId: string, drawerId: string, turnId: string): Promise<string> => {
+    const strokeRef = push(ref(database, `rooms/${roomId}/strokes`))
+    await set(strokeRef, {
+      id: strokeRef.key,
+      authorId: drawerId,
+      turnId,
+      tool: 'clear',
+      points: [],
+      color: '#ffffff',
+      size: 0,
+      createdAt: serverTimestamp(),
+    })
+    return strokeRef.key ?? ''
+  }
+
   const beginRound = async (roomId: string, hostId: string, choices: Word[], requiredStatus: Room['status']): Promise<Room | null> => {
     const room = await readRoom(roomId)
     if (!room || room.hostId !== hostId || room.status !== requiredStatus) return room
@@ -150,13 +165,24 @@ export const createRoomRepository = (database: Database) => {
       choices: choices.slice(0, 3),
       answer: null,
     })
-    await update(roomRef(roomId), {
+    const updates: Record<string, unknown> = {
       status: next.status,
+      'game/sessionId': next.game.sessionId ?? null,
       'game/turnId': next.game.turnId,
       'game/turnIndex': next.game.turnIndex,
       'game/round': next.game.round,
       'game/drawerId': next.game.drawerId,
-    })
+      'game/phaseEndsAt': null,
+      'game/revealedAnswer': null,
+      'game/wordLength': null,
+      'game/wordHint': null,
+    }
+    if (requiredStatus === 'finished') {
+      for (const playerId of Object.keys(room.players)) {
+        updates[`players/${playerId}/score`] = 0
+      }
+    }
+    await update(roomRef(roomId), updates)
     return readRoom(roomId)
   }
 
@@ -165,6 +191,45 @@ export const createRoomRepository = (database: Database) => {
 
   const advanceRound = (roomId: string, hostId: string, choices: Word[]): Promise<Room | null> =>
     beginRound(roomId, hostId, choices, 'results')
+
+  const finishGame = async (roomId: string, hostId: string): Promise<Room | null> => {
+    const room = await readRoom(roomId)
+    if (!room || room.hostId !== hostId || room.status !== 'results') return room
+    await update(roomRef(roomId), {
+      status: 'finished',
+      'game/phaseEndsAt': null,
+    })
+    return readRoom(roomId)
+  }
+
+  const replayGame = async (roomId: string, hostId: string, choices: Word[]): Promise<Room | null> => {
+    const room = await readRoom(roomId)
+    if (!room || room.hostId !== hostId || room.status !== 'finished') return room
+    return beginRound(roomId, hostId, choices, 'finished')
+  }
+
+  const returnToLobby = async (roomId: string, hostId: string): Promise<Room | null> => {
+    const room = await readRoom(roomId)
+    if (!room || room.hostId !== hostId || room.status !== 'finished') return room
+    const nextSessionId = generateSessionId()
+    const updates: Record<string, unknown> = {
+      status: 'lobby',
+      'game/sessionId': nextSessionId,
+      'game/turnId': null,
+      'game/turnIndex': 0,
+      'game/round': 0,
+      'game/drawerId': null,
+      'game/phaseEndsAt': null,
+      'game/revealedAnswer': null,
+      'game/wordLength': null,
+      'game/wordHint': null,
+    }
+    for (const playerId of Object.keys(room.players)) {
+      updates[`players/${playerId}/score`] = 0
+    }
+    await update(roomRef(roomId), updates)
+    return readRoom(roomId)
+  }
 
   const chooseWord = async (roomId: string, drawerId: string, word: Word): Promise<Room | null> => {
     const room = await readRoom(roomId)
@@ -184,6 +249,8 @@ export const createRoomRepository = (database: Database) => {
     await update(roomRef(roomId), {
       status: 'drawing',
       'game/phaseEndsAt': phaseEndsAt,
+      'game/wordLength': word.text.replace(/\s+/g, '').length,
+      'game/wordHint': formatWordBlanks(word.text, room.settings.language),
     })
     return readRoom(roomId)
   }
@@ -224,7 +291,13 @@ export const createRoomRepository = (database: Database) => {
     if (!updatedRoom) return true
 
     if (allConnectedGuessersAreCorrect(updatedRoom)) {
-      await update(roomRef(roomId), { status: 'results' })
+      const updates: Record<string, unknown> = {
+        status: 'results',
+      }
+      if (secret?.answer) {
+        updates['game/revealedAnswer'] = secret.answer
+      }
+      await update(roomRef(roomId), updates)
     }
     return true
   }
@@ -249,23 +322,88 @@ export const createRoomRepository = (database: Database) => {
     })
   }
 
+  const finishDrawing = async (roomId: string, callerId?: string): Promise<Room | null> => {
+    const room = await readRoom(roomId)
+    if (!room || (room.status !== 'drawing' && room.status !== 'results')) return room
+
+    let secretAnswer: Word | null = null
+    const isKnownDrawer = callerId ? room.game.drawerId === callerId : true
+
+    if (isKnownDrawer) {
+      try {
+        const secret = (await get(secretRef(roomId))).val() as { answer?: Word } | null
+        secretAnswer = secret?.answer ?? null
+      } catch {
+        // Fallback: don't fail turn completion if reading secret fails
+      }
+    }
+
+    const updates: Record<string, unknown> = {}
+    if (room.status === 'drawing') {
+      updates.status = 'results'
+      updates['game/phaseEndsAt'] = null
+    }
+    if (secretAnswer && !room.game.revealedAnswer) {
+      updates['game/revealedAnswer'] = secretAnswer
+    }
+
+    if (Object.keys(updates).length > 0) {
+      await update(roomRef(roomId), updates)
+    }
+    return readRoom(roomId)
+  }
+
+  const updateWordHint = async (roomId: string, drawerId: string, hint: string): Promise<void> => {
+    const room = await readRoom(roomId)
+    if (!room || room.status !== 'drawing' || room.game.drawerId !== drawerId) return
+    await update(roomRef(roomId), {
+      'game/wordHint': hint,
+    })
+  }
+
+  const subscribeToPlayerGuess = (
+    roomId: string,
+    turnId: string,
+    playerId: string,
+    onGuess: (text: string | null) => void,
+  ): Unsubscribe =>
+    onValue(ref(database, `roomGuesses/${roomId}/${turnId}/${playerId}`), snapshot => {
+      const val = snapshot.val() as { text?: string } | null
+      onGuess(val?.text ?? null)
+    })
+
   const updateRoomSettings = (roomId: string, settings: RoomSettings): Promise<void> =>
     set(ref(database, `rooms/${roomId}/settings`), settings)
 
+  const subscribeToServerTimeOffset = (callback: (offset: number) => void): Unsubscribe =>
+    onValue(ref(database, '.info/serverTimeOffset'), snapshot => {
+      const offset = snapshot.val()
+      callback(typeof offset === 'number' ? offset : 0)
+    })
+
   return {
     appendStroke,
+    clearCanvas,
     adjudicateGuess,
     advanceRound,
     awardCorrectGuess,
     chooseWord,
     createRoom,
+    finishDrawing,
+    finishGame,
+    replayGame,
+    returnToLobby,
+    updateWordHint,
     getRoom: readRoom,
+    getServerNow: () => serverNow(database),
     joinRoom,
     sendGuess,
     setPlayerPresence,
     startGame,
     subscribeToRoom,
     subscribeToRoundSecret,
+    subscribeToPlayerGuess,
+    subscribeToServerTimeOffset,
     updateRoomSettings,
   }
 }

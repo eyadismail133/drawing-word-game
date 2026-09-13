@@ -1,6 +1,8 @@
-import { useState, useEffect, useId, type FormEvent, type ChangeEvent } from 'react'
+import { useState, useEffect, useId, useCallback, type FormEvent, type ChangeEvent } from 'react'
 import type { Language } from '../features/game/domain'
 import type { RoomSettings } from '../features/room/types'
+import { getSavedAvatar, saveAvatar, type Avatar } from '../features/avatar/avatar'
+import { AvatarSelector } from './AvatarSelector'
 
 export type CreateRoomParams = {
   name: string
@@ -8,11 +10,13 @@ export type CreateRoomParams = {
   drawSeconds: 60 | 80 | 100
   rounds: 1 | 2 | 3
   settings: RoomSettings
+  avatar?: Avatar
 }
 
 export type JoinRoomParams = {
   name: string
   roomId: string
+  avatar?: Avatar
 }
 
 export type LobbyPageProps = {
@@ -39,10 +43,16 @@ export function LobbyPage({
   const roomCodeId = useId()
 
   const [name, setName] = useState<string>(initialName)
+  const [avatar, setAvatar] = useState<Avatar>(() => getSavedAvatar())
   const [language, setLanguage] = useState<Language>('english')
   const [drawSeconds, setDrawSeconds] = useState<60 | 80 | 100>(80)
   const [rounds, setRounds] = useState<1 | 2 | 3>(3)
   const [roomInput, setRoomInput] = useState<string>(initialRoomId)
+
+  const handleAvatarChange = useCallback((newAvatar: Avatar) => {
+    setAvatar(newAvatar)
+    saveAvatar(newAvatar)
+  }, [])
 
   useEffect(() => {
     setRoomInput(initialRoomId)
@@ -115,6 +125,7 @@ export function LobbyPage({
         rounds,
         maxPlayers: 10,
       },
+      avatar,
     })
   }
 
@@ -125,11 +136,20 @@ export function LobbyPage({
     onJoin({
       name: trimmedName,
       roomId: cleanRoomId,
+      avatar,
     })
   }
 
   const isRtl = language === 'arabic'
   const isSubmitDisabled = !isNameValid || isLoading || isAuthPending
+
+  const handleRoomInputPaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
+    const pasted = e.clipboardData?.getData('text')
+    if (pasted) {
+      e.preventDefault()
+      setRoomInput(pasted)
+    }
+  }
 
   return (
     <div className="lobby-container">
@@ -169,6 +189,12 @@ export function LobbyPage({
             </p>
           )}
         </div>
+
+        <AvatarSelector
+          value={avatar}
+          onChange={handleAvatarChange}
+          disabled={isLoading || isAuthPending}
+        />
 
         <div className="lobby-grid">
           {/* Create Room Panel */}
@@ -258,6 +284,7 @@ export function LobbyPage({
                   placeholder="e.g. AB12CD or paste invite URL"
                   value={roomInput}
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setRoomInput(e.target.value)}
+                  onPaste={handleRoomInputPaste}
                   disabled={isLoading || isAuthPending}
                 />
                 <p className="form-field-hint">6-character code or invite link</p>

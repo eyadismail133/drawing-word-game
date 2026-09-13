@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { onValue, ref, type Database } from 'firebase/database'
-import { chooseWords } from './domain'
+import { chooseWords, getProgressiveWordHint, type Word } from './domain'
 import { ALL_WORDS } from './words'
 import { createRoomRepository } from '../room/repository'
-import type { Room, RoomSettings } from '../room/types'
+import type { Room, RoomSettings, Stroke } from '../room/types'
+import type { Avatar } from '../avatar/avatar'
+import { getDeterministicAvatar } from '../avatar/avatar'
 
 export const generateRoomId = (): string => {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -14,17 +16,32 @@ export const generateRoomId = (): string => {
   return id
 }
 
+export type RoundSecret = {
+  answer: Word | null
+  choices: Word[]
+}
+
 export type UseRoomGameReturn = {
   room: Room | null
   loading: boolean
   error: Error | null
-  createRoom: (name: string, settings: RoomSettings) => Promise<Room>
-  joinRoom: (roomId: string, name: string) => Promise<boolean>
+  roundSecret: RoundSecret | null
+  serverTimeOffset: number
+  createRoom: (name: string, settings: RoomSettings, avatar?: Avatar) => Promise<Room>
+  joinRoom: (roomId: string, name: string, avatar?: Avatar) => Promise<boolean>
   startGame: () => Promise<void>
   updateRoomSettings: (settings: RoomSettings) => Promise<void>
   leaveRoom: () => Promise<void>
   retry: () => void
   clearError: () => void
+  chooseWord: (word: Word) => Promise<void>
+  appendStroke: (stroke: Omit<Stroke, 'id' | 'createdAt'>) => Promise<string>
+  clearCanvas: () => Promise<string>
+  sendGuess: (guessText: string) => Promise<boolean>
+  finishDrawing: () => Promise<void>
+  advanceRound: () => Promise<void>
+  replayGame: () => Promise<void>
+  returnToLobby: () => Promise<void>
 }
 
 let databasePromise: Promise<Database> | null = null
@@ -44,6 +61,8 @@ export function useRoomGame(
   const [loading, setLoading] = useState<boolean>(Boolean(roomId))
   const [error, setError] = useState<Error | null>(null)
   const [attempt, setAttempt] = useState<number>(0)
+  const [roundSecret, setRoundSecret] = useState<RoundSecret | null>(null)
+  const [serverTimeOffset, setServerTimeOffset] = useState<number>(0)
 
   const memberRoomIdRef = useRef<string | null>(null)
   const presenceRoomIdRef = useRef<string | null>(null)
@@ -65,8 +84,31 @@ export function useRoomGame(
     }
   }, [isMember, roomId])
 
+  // Track Realtime Database server time offset
+  useEffect(() => {
+    let isSubscribed = true
+    let unsub: (() => void) | null = null
+    loadDatabase()
+      .then((db) => {
+        if (!isSubscribed) return
+        const repository = createRoomRepository(db)
+        if (typeof repository.subscribeToServerTimeOffset === 'function') {
+          unsub = repository.subscribeToServerTimeOffset((offset) => {
+            if (isSubscribed) setServerTimeOffset(offset)
+          })
+        }
+      })
+      .catch(() => {})
+
+    return () => {
+      isSubscribed = false
+      if (unsub) unsub()
+    }
+  }, [])
+
   const retry = useCallback(() => {
     setError(null)
+    setRoundSecret(null)
     lastPresenceRef.current = null
     presenceRoomIdRef.current = null
     pendingPresenceRoomIdRef.current = null
@@ -180,6 +222,7 @@ export function useRoomGame(
   useEffect(() => {
     if (!roomId) {
       setRoom(null)
+      setRoundSecret(null)
       setLoading(false)
       setError(null)
       lastPresenceRef.current = null
@@ -281,11 +324,12 @@ export function useRoomGame(
   }, [roomId, userId, getRepository, attempt])
 
   const createRoom = useCallback(
-    async (name: string, settings: RoomSettings): Promise<Room> => {
+    async (name: string, settings: RoomSettings, avatar?: Avatar): Promise<Room> => {
       if (!userId) {
         throw new Error('Authentication required to create a room')
       }
       const newRoomId = generateRoomId()
+      const hostAvatar = avatar || getDeterministicAvatar(userId, name.trim())
       const initialRoom: Room = {
         id: newRoomId,
         hostId: userId,
@@ -297,12 +341,14 @@ export function useRoomGame(
             name: name.trim(),
             score: 0,
             connected: true,
+            avatar: hostAvatar,
           },
         },
         slots: {
           '0': userId,
         },
         game: {
+          sessionId: null,
           turnId: null,
           turnIndex: 0,
           round: 0,
@@ -330,11 +376,12 @@ export function useRoomGame(
   )
 
   const joinRoom = useCallback(
-    async (targetRoomId: string, name: string): Promise<boolean> => {
+    async (targetRoomId: string, name: string, avatar?: Avatar): Promise<boolean> => {
       if (!userId) {
         throw new Error('Authentication required to join a room')
       }
       const cleanId = targetRoomId.trim().toUpperCase()
+      const playerAvatar = avatar || getDeterministicAvatar(userId, name.trim())
       setError(null)
       const repository = await getRepository()
       const result = await repository.joinRoom(cleanId, {
@@ -342,6 +389,7 @@ export function useRoomGame(
         name: name.trim(),
         score: 0,
         connected: true,
+        avatar: playerAvatar,
       })
 
       if (!result.ok) {
@@ -451,6 +499,7 @@ export function useRoomGame(
         (!activeRoomIdRef.current || activeRoomIdRef.current === targetRoomId)
       ) {
         setRoom(null)
+        setRoundSecret(null)
         setError(null)
       }
     } catch (err) {
@@ -466,10 +515,309 @@ export function useRoomGame(
     }
   }, [userId, getRepository])
 
+  // Subscribe to round secret for active drawer
+  useEffect(() => {
+    if (!roomId || !userId || !activeRoom || activeRoom.game.drawerId !== userId) {
+      setRoundSecret(null)
+      return
+    }
+
+    let isSubscribed = true
+    let unsubscribe: (() => void) | null = null
+
+    loadDatabase()
+      .then((db) => {
+        if (!isSubscribed) return
+        const repository = createRoomRepository(db)
+        if (typeof repository.subscribeToRoundSecret === 'function') {
+          unsubscribe = repository.subscribeToRoundSecret(roomId, (secret) => {
+            if (isSubscribed) {
+              setRoundSecret(secret)
+            }
+          })
+        }
+      })
+      .catch(() => {})
+
+    return () => {
+      isSubscribed = false
+      if (unsubscribe) unsubscribe()
+    }
+  }, [roomId, userId, activeRoom?.game.drawerId])
+
+  // Active drawer listens to guesses and adjudicates across all room members (reconciles on reconnect)
+  useEffect(() => {
+    if (
+      !roomId ||
+      !userId ||
+      !activeRoom ||
+      activeRoom.status !== 'drawing' ||
+      activeRoom.game.drawerId !== userId ||
+      !activeRoom.game.turnId
+    ) {
+      return
+    }
+
+    const turnId = activeRoom.game.turnId
+    const unsubs: (() => void)[] = []
+    let isSubscribed = true
+
+    loadDatabase()
+      .then((db) => {
+        if (!isSubscribed) return
+        const repository = createRoomRepository(db)
+        if (typeof repository.subscribeToPlayerGuess !== 'function') return
+
+        // Cover all room members other than the drawer; reconnecting players will trigger adjudication
+        const guesserIds = Object.keys(activeRoom.players).filter((id) => id !== userId)
+
+        for (const guesserId of guesserIds) {
+          const unsub = repository.subscribeToPlayerGuess(
+            roomId,
+            turnId,
+            guesserId,
+            (guessText) => {
+              if (!isSubscribed || !guessText) return
+              repository.adjudicateGuess(roomId, guesserId).catch(() => {})
+            }
+          )
+          unsubs.push(unsub)
+        }
+      })
+      .catch(() => {})
+
+    return () => {
+      isSubscribed = false
+      unsubs.forEach((u) => u())
+    }
+  }, [
+    roomId,
+    userId,
+    activeRoom?.status,
+    activeRoom?.game.turnId,
+    activeRoom?.game.drawerId,
+    activeRoom?.players ? Object.keys(activeRoom.players).sort().join(',') : '',
+  ])
+
+  const inFlightAwardsRef = useRef<Record<string, boolean>>({})
+
+  // Host automatically awards points when a player is adjudicated correct (exactly once per player per turn)
+  useEffect(() => {
+    if (
+      !roomId ||
+      !userId ||
+      !activeRoom ||
+      activeRoom.hostId !== userId ||
+      !activeRoom.game.turnId
+    ) {
+      return
+    }
+
+    const turnId = activeRoom.game.turnId
+    const correctGuesserIds = activeRoom.game.correctGuesserIds[turnId] ?? {}
+    const awards = activeRoom.game.awards[turnId] ?? {}
+
+    for (const playerId of Object.keys(correctGuesserIds)) {
+      const awardKey = `${turnId}:${playerId}`
+      if (!awards[playerId] && !inFlightAwardsRef.current[awardKey]) {
+        inFlightAwardsRef.current[awardKey] = true
+        loadDatabase()
+          .then((db) => {
+            const repository = createRoomRepository(db)
+            return repository.awardCorrectGuess(roomId, userId, playerId)
+          })
+          .catch(() => {
+            delete inFlightAwardsRef.current[awardKey]
+          })
+      }
+    }
+  }, [
+    roomId,
+    userId,
+    activeRoom?.hostId,
+    activeRoom?.game.turnId,
+    activeRoom?.game.correctGuesserIds,
+    activeRoom?.game.awards,
+  ])
+
+  // Active drawer progressively updates word hint letters as drawing time elapses
+  useEffect(() => {
+    if (
+      !roomId ||
+      !userId ||
+      !activeRoom ||
+      activeRoom.status !== 'drawing' ||
+      activeRoom.game.drawerId !== userId ||
+      !roundSecret?.answer?.text ||
+      !activeRoom.game.phaseEndsAt
+    ) {
+      return
+    }
+
+    const answerWord = roundSecret.answer.text
+    const phaseEndsAt = activeRoom.game.phaseEndsAt
+    const drawSeconds = activeRoom.settings.drawSeconds
+    const totalMs = drawSeconds * 1000
+
+    const interval = setInterval(() => {
+      const now = Date.now() + serverTimeOffset
+      const remainingMs = Math.max(0, phaseEndsAt - now)
+      const fractionElapsed = 1 - remainingMs / totalMs
+
+      const nextHint = getProgressiveWordHint(
+        answerWord,
+        fractionElapsed,
+        activeRoom.settings.language
+      )
+
+      if (nextHint !== activeRoom.game.wordHint) {
+        getRepository()
+          .then((repository) => {
+            if (typeof repository.updateWordHint === 'function') {
+              repository.updateWordHint(roomId, userId, nextHint).catch(() => {})
+            }
+          })
+          .catch(() => {})
+      }
+    }, 1000)
+
+    return () => clearInterval(interval)
+  }, [
+    roomId,
+    userId,
+    activeRoom?.status,
+    activeRoom?.game.drawerId,
+    activeRoom?.game.phaseEndsAt,
+    activeRoom?.game.wordHint,
+    activeRoom?.settings.drawSeconds,
+    activeRoom?.settings.language,
+    roundSecret?.answer?.text,
+    serverTimeOffset,
+    getRepository,
+  ])
+
+  const chooseWord = useCallback(
+    async (word: Word): Promise<void> => {
+      if (!roomId || !userId || !activeRoom) {
+        throw new Error('Cannot choose word: room not ready')
+      }
+      if (activeRoom.game.drawerId !== userId) {
+        throw new Error('Only the active drawer can choose a word')
+      }
+      const repository = await getRepository()
+      await repository.chooseWord(roomId, userId, word)
+    },
+    [roomId, userId, activeRoom, getRepository]
+  )
+
+  const appendStroke = useCallback(
+    async (stroke: Omit<Stroke, 'id' | 'createdAt'>): Promise<string> => {
+      if (!roomId || !userId || !activeRoom) {
+        throw new Error('Cannot append stroke: room not ready')
+      }
+      if (activeRoom.game.drawerId !== userId) {
+        throw new Error('Only the active drawer can draw')
+      }
+      const repository = await getRepository()
+      return repository.appendStroke(roomId, stroke)
+    },
+    [roomId, userId, activeRoom, getRepository]
+  )
+
+  const clearCanvas = useCallback(async (): Promise<string> => {
+    if (!roomId || !userId || !activeRoom) {
+      throw new Error('Cannot clear canvas: room not ready')
+    }
+    if (activeRoom.game.drawerId !== userId) {
+      throw new Error('Only the active drawer can clear the canvas')
+    }
+    const repository = await getRepository()
+    return repository.clearCanvas(roomId, userId, activeRoom.game.turnId ?? '')
+  }, [roomId, userId, activeRoom, getRepository])
+
+  const sendGuess = useCallback(
+    async (guessText: string): Promise<boolean> => {
+      if (!roomId || !userId || !activeRoom) {
+        throw new Error('Cannot send guess: room not ready')
+      }
+      if (activeRoom.game.drawerId === userId) {
+        throw new Error('Active drawer cannot submit guesses')
+      }
+      const repository = await getRepository()
+      await repository.sendGuess(roomId, userId, guessText)
+      // Host safely invokes the adjudicate/award pathway
+      try {
+        await repository.adjudicateGuess(roomId, userId)
+      } catch {
+        // Safe: non-drawer callers will receive permission denied which is expected
+      }
+      return true
+    },
+    [roomId, userId, activeRoom, getRepository]
+  )
+
+  const finishDrawing = useCallback(async (): Promise<void> => {
+    if (!roomId || !activeRoom) return
+    const repository = await getRepository()
+    if (typeof repository.finishDrawing === 'function') {
+      await repository.finishDrawing(roomId, userId ?? undefined)
+    }
+  }, [roomId, activeRoom, userId, getRepository])
+
+  const advanceRound = useCallback(async (): Promise<void> => {
+    if (!roomId || !userId || !activeRoom) return
+    if (activeRoom.hostId !== userId) {
+      throw new Error('Only the room host can advance the round')
+    }
+    const connectedCount = Math.max(
+      1,
+      Object.values(activeRoom.players).filter((p) => p.connected).length
+    )
+    const nextTurnIndex = activeRoom.game.turnIndex + 1
+    const nextRound = Math.floor(nextTurnIndex / connectedCount) + 1
+
+    const repository = await getRepository()
+    if (nextRound > activeRoom.settings.rounds) {
+      if (typeof repository.finishGame === 'function') {
+        await repository.finishGame(roomId, userId)
+      }
+    } else {
+      const choices = chooseWords(activeRoom.settings.language, ALL_WORDS, 3)
+      await repository.advanceRound(roomId, userId, choices)
+    }
+  }, [roomId, userId, activeRoom, getRepository])
+
+  const replayGame = useCallback(async (): Promise<void> => {
+    if (!roomId || !userId || !activeRoom) return
+    if (activeRoom.hostId !== userId) {
+      throw new Error('Only the room host can restart the game')
+    }
+    const choices = chooseWords(activeRoom.settings.language, ALL_WORDS, 3)
+    const repository = await getRepository()
+    if (typeof repository.replayGame === 'function') {
+      await repository.replayGame(roomId, userId, choices)
+    } else {
+      await repository.advanceRound(roomId, userId, choices)
+    }
+  }, [roomId, userId, activeRoom, getRepository])
+
+  const returnToLobby = useCallback(async (): Promise<void> => {
+    if (!roomId || !userId || !activeRoom) return
+    if (activeRoom.hostId !== userId) {
+      throw new Error('Only the room host can return to the lobby')
+    }
+    const repository = await getRepository()
+    if (typeof repository.returnToLobby === 'function') {
+      await repository.returnToLobby(roomId, userId)
+    }
+  }, [roomId, userId, activeRoom, getRepository])
+
   return {
     room: activeRoom,
     loading,
     error,
+    roundSecret,
+    serverTimeOffset,
     createRoom,
     joinRoom,
     startGame,
@@ -477,5 +825,13 @@ export function useRoomGame(
     leaveRoom,
     retry,
     clearError,
+    chooseWord,
+    appendStroke,
+    clearCanvas,
+    sendGuess,
+    finishDrawing,
+    advanceRound,
+    replayGame,
+    returnToLobby,
   }
 }

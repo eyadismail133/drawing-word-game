@@ -1,4 +1,5 @@
 import { nextDrawerId, type Language, type Player, type Word } from '../game/domain'
+import { getDeterministicAvatar, isValidAvatar } from '../avatar/avatar'
 
 export type RoomStatus = 'lobby' | 'choosing' | 'drawing' | 'results' | 'finished'
 
@@ -10,12 +11,16 @@ export type RoomSettings = {
 }
 
 export type GameState = {
+  sessionId?: string | null
   turnId: string | null
   turnIndex: number
   round: number
   drawerId: string | null
   phaseEndsAt: number | null
   answer: Word | null
+  revealedAnswer?: Word | null
+  wordLength?: number | null
+  wordHint?: string | null
   choices: Word[]
   correctGuesserIds: Record<string, Record<string, true>>
   awards: Record<string, Record<string, true>>
@@ -25,10 +30,11 @@ export type StrokePoint = { x: number; y: number }
 
 export type Stroke = {
   id: string
-  points: StrokePoint[]
+  turnId?: string
+  points?: StrokePoint[]
   color: string
   size: number
-  tool: 'pen' | 'eraser'
+  tool: 'pen' | 'eraser' | 'clear'
   authorId: string
   createdAt: number | null
 }
@@ -58,13 +64,26 @@ export const normalizeRoom = (value: PersistedRoom | null): Room | null => {
 
   return {
     ...value,
+    players: Object.fromEntries(
+      Object.entries(value.players ?? {}).map(([id, p]) => [
+        id,
+        {
+          ...p,
+          avatar: isValidAvatar(p.avatar) ? p.avatar : getDeterministicAvatar(p.id, p.name),
+        },
+      ])
+    ),
     strokes: value.strokes ?? {},
     game: {
+      sessionId: typeof game.sessionId === 'string' ? game.sessionId : null,
       turnIndex: game.turnIndex ?? 0,
       round: game.round ?? 0,
       drawerId: game.drawerId ?? null,
       phaseEndsAt: game.phaseEndsAt ?? null,
       answer: game.answer ?? null,
+      revealedAnswer: game.revealedAnswer ?? null,
+      wordLength: typeof game.wordLength === 'number' ? game.wordLength : null,
+      wordHint: typeof game.wordHint === 'string' ? game.wordHint : null,
       choices: persistedList(value.game.choices),
       turnId: game.turnId ?? null,
       correctGuesserIds: game.correctGuesserIds && !Array.isArray(game.correctGuesserIds)
@@ -102,26 +121,64 @@ const cloneRoom = (room: Room): Room => ({
   },
 })
 
+let lastSessionTimestamp = 0
+export const generateSessionId = (): string => {
+  const now = Date.now()
+  lastSessionTimestamp = now > lastSessionTimestamp ? now : lastSessionTimestamp + 1
+  return String(lastSessionTimestamp)
+}
+
 export const startRound = (room: Room): Room => {
-  const drawerId = nextDrawerId(room.players, room.game.drawerId)
+  const isReplay = room.status === 'finished'
+  const isLobbyRestart = room.status === 'lobby' && Boolean(room.game.sessionId)
+  const isNewGame = room.status === 'lobby' || isReplay
+  const drawerId = isNewGame
+    ? nextDrawerId(room.players, null)
+    : nextDrawerId(room.players, room.game.drawerId)
   if (!drawerId) return room
 
   const next = cloneRoom(room)
-  const connectedCount = Object.values(room.players).filter((player) => player.connected).length
-  const nextTurnIndex = room.status === 'lobby' ? 0 : room.game.turnIndex + 1
+  const connectedCount = Math.max(1, Object.values(room.players).filter((player) => player.connected).length)
+  const nextTurnIndex = isNewGame ? 0 : room.game.turnIndex + 1
+
+  let sessionId: string | null = null
+  let turnId: string
+
+  if (isReplay) {
+    sessionId = generateSessionId()
+    turnId = `g${sessionId}-t0`
+  } else if (isLobbyRestart) {
+    sessionId = room.game.sessionId!
+    turnId = `g${sessionId}-t0`
+  } else if (room.game.turnId && room.game.turnId.startsWith('g')) {
+    sessionId = room.game.sessionId ?? room.game.turnId.split('-t')[0].replace(/^g/, '')
+    turnId = `g${sessionId}-t${nextTurnIndex}`
+  } else {
+    sessionId = null
+    turnId = `turn-${nextTurnIndex}`
+  }
 
   next.status = 'choosing'
   next.game = {
+    sessionId,
     turnIndex: nextTurnIndex,
-    turnId: `turn-${nextTurnIndex}`,
+    turnId,
     round: Math.floor(nextTurnIndex / connectedCount) + 1,
     drawerId,
     phaseEndsAt: null,
     answer: null,
     choices: [],
-    correctGuesserIds: next.game.correctGuesserIds,
-    awards: next.game.awards,
+    correctGuesserIds: isNewGame ? {} : next.game.correctGuesserIds,
+    awards: isNewGame ? {} : next.game.awards,
   }
+
+  if (isNewGame) {
+    for (const p of Object.values(next.players)) {
+      p.score = 0
+    }
+    next.game.revealedAnswer = null
+  }
+
   return next
 }
 

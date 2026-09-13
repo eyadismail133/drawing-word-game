@@ -6,6 +6,9 @@ import {
   scoreGuess,
   chooseWords,
   nextDrawerId,
+  isArabicText,
+  formatWordBlanks,
+  getProgressiveWordHint,
 } from '../../src/features/game/domain'
 import {
   ENGLISH_WORDS,
@@ -223,10 +226,34 @@ describe('room transitions', () => {
     expect(canJoinRoom(makeRoom(players), 'new')).toBe(false)
   })
 
-  it('starts a lobby turn in choosing', () => {
+  it('starts a lobby turn in choosing with turn-0 for a brand new room', () => {
     const room = makeRoom({ p1: player('p1'), p2: player('p2') })
 
-    expect(startRound(room).status).toBe('choosing')
+    const started = startRound(room)
+    expect(started.status).toBe('choosing')
+    expect(started.game.turnId).toBe('turn-0')
+    expect(started.game.turnIndex).toBe(0)
+    expect(started.game.round).toBe(1)
+  })
+
+  it('assigns a fresh unique turnId when starting from lobby with sessionId even with no public prior data', () => {
+    const room = makeRoom({ p1: player('p1'), p2: player('p2') })
+    // Explicit session ID provisioned upon returnToLobby (no strokes, no awards, no correct guessers)
+    room.game.sessionId = '1726000000000'
+
+    const started = startRound(room)
+    expect(started.status).toBe('choosing')
+    expect(started.game.turnId).toBe('g1726000000000-t0')
+    expect(started.game.turnIndex).toBe(0)
+    expect(started.game.round).toBe(1)
+    expect(started.players['p1'].score).toBe(0)
+    expect(started.players['p2'].score).toBe(0)
+
+    // And subsequent turn preserves the unique game prefix
+    started.status = 'results'
+    const nextTurn = startRound(started)
+    expect(nextTurn.game.turnId).toBe('g1726000000000-t1')
+    expect(nextTurn.game.turnIndex).toBe(1)
   })
 
   it('ends when all connected guessers are correct', () => {
@@ -264,5 +291,82 @@ describe('room transitions', () => {
 
     expect(isRoundExpired(room, 1_000)).toBe(true)
     expect(applyCorrectGuess(room, 'p2', 1_000)).toBe(room)
+  })
+})
+
+describe('isArabicText and formatWordBlanks', () => {
+  it('detects Arabic script accurately', () => {
+    expect(isArabicText('قطة')).toBe(true)
+    expect(isArabicText('قوس قزح')).toBe(true)
+    expect(isArabicText('cat')).toBe(false)
+    expect(isArabicText('rainbow')).toBe(false)
+  })
+
+  it('formats word blanks with correct letter counts for English', () => {
+    expect(formatWordBlanks('cat')).toBe('_ _ _ (3 letters)')
+    expect(formatWordBlanks('ice cream')).toBe('_ _ _   _ _ _ _ _ (8 letters)')
+    expect(formatWordBlanks('a')).toBe('_ (1 letter)')
+  })
+
+  it('formats word blanks with correct Arabic numerals and units for Arabic', () => {
+    expect(formatWordBlanks('قطة')).toBe('_ _ _ (3 أحرف)')
+    expect(formatWordBlanks('قوس قزح')).toBe('_ _ _   _ _ _ (6 أحرف)')
+    expect(formatWordBlanks('ب')).toBe('_ (1 حرف)')
+    expect(formatWordBlanks('يد')).toBe('_ _ (2 حرفان)')
+  })
+
+  it('formats word blanks with Arabic units when language is explicitly arabic even for blanks', () => {
+    expect(formatWordBlanks('___', 'arabic')).toBe('_ _ _ (3 أحرف)')
+    expect(formatWordBlanks('__', 'arabic')).toBe('_ _ (2 حرفان)')
+    expect(formatWordBlanks('_', 'arabic')).toBe('_ (1 حرف)')
+  })
+})
+
+describe('getProgressiveWordHint', () => {
+  it('does not reveal any letters when less than 50% of time has elapsed', () => {
+    expect(getProgressiveWordHint('cat', 0.2, 'english')).toBe('_ _ _ (3 letters)')
+    expect(getProgressiveWordHint('dolphin', 0.49, 'english')).toBe('_ _ _ _ _ _ _ (7 letters)')
+    expect(getProgressiveWordHint('سيارة', 0.3, 'arabic')).toBe('_ _ _ _ _ (5 أحرف)')
+  })
+
+  it('reveals exactly one letter at 50% elapsed for words with 3 or more letters', () => {
+    const hint = getProgressiveWordHint('cat', 0.5, 'english')
+    expect(hint).toContain('(3 letters)')
+    // Must contain exactly 1 letter revealed and 2 blanks
+    const blanks = hint.split('(')[0].trim().split(' ')
+    const revealedCount = blanks.filter((c) => c !== '_').length
+    expect(revealedCount).toBe(1)
+  })
+
+  it('reveals up to two letters at 75% elapsed for longer words without revealing the whole word', () => {
+    const hint = getProgressiveWordHint('dolphin', 0.75, 'english')
+    expect(hint).toContain('(7 letters)')
+    const blanks = hint.split('(')[0].trim().split(' ')
+    const revealedCount = blanks.filter((c) => c !== '_').length
+    expect(revealedCount).toBe(2)
+    // The majority of letters must remain hidden
+    expect(blanks.filter((c) => c === '_').length).toBe(5)
+  })
+
+  it('preserves Arabic script, RTL word shapes, and units', () => {
+    const arHint50 = getProgressiveWordHint('سيارة', 0.5, 'arabic')
+    expect(arHint50).toContain('(5 أحرف)')
+    expect(/[\u0600-\u06FF]/.test(arHint50)).toBe(true)
+
+    const arHint75 = getProgressiveWordHint('سيارة', 0.75, 'arabic')
+    expect(arHint75).toContain('(5 أحرف)')
+    const blanks = arHint75.split('(')[0].trim().split(' ')
+    const revealedCount = blanks.filter((c) => c !== '_').length
+    expect(revealedCount).toBe(2)
+  })
+
+  it('never reveals full word before results even at 99% elapsed', () => {
+    const hint = getProgressiveWordHint('elephant', 0.99, 'english')
+    expect(hint).toContain('_')
+  })
+
+  it('does not reveal letters for very short words (2 letters or less)', () => {
+    expect(getProgressiveWordHint('ox', 0.9, 'english')).toBe('_ _ (2 letters)')
+    expect(getProgressiveWordHint('يد', 0.9, 'arabic')).toBe('_ _ (2 حرفان)')
   })
 })

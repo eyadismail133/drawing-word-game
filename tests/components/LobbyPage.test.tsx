@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { LobbyPage } from '../../src/components/LobbyPage'
@@ -130,6 +130,102 @@ describe('LobbyPage', () => {
       expect.objectContaining({
         name: 'Player3',
         roomId: 'MN45KL',
+      })
+    )
+  })
+
+  it('renders avatar selector and passes selected avatar to onCreate', async () => {
+    const user = userEvent.setup()
+    const onCreate = vi.fn()
+    render(<LobbyPage onCreate={onCreate} onJoin={vi.fn()} />)
+
+    // Verify avatar section exists with preview and presets
+    expect(screen.getByRole('region', { name: /choose your avatar/i })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: /select robot avatar/i })).toBeInTheDocument()
+
+    // Select the robot preset
+    await user.click(screen.getByRole('radio', { name: /select robot avatar/i }))
+
+    // Fill name and submit
+    await user.type(screen.getByLabelText(/your name/i), 'RoboDrawer')
+    await user.click(screen.getByRole('button', { name: /create room/i }))
+
+    expect(onCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'RoboDrawer',
+        avatar: expect.objectContaining({
+          presetId: 'robot',
+        }),
+      })
+    )
+  })
+
+  it('passes selected avatar to onJoin', async () => {
+    const user = userEvent.setup()
+    const onJoin = vi.fn()
+    render(<LobbyPage onCreate={vi.fn()} onJoin={onJoin} />)
+
+    // Select the dino preset
+    await user.click(screen.getByRole('radio', { name: /select dino avatar/i }))
+
+    // Fill name and room ID
+    await user.type(screen.getByLabelText(/your name/i), 'DinoGuesser')
+    await user.type(screen.getByLabelText(/room code/i), 'DINO99')
+    await user.click(screen.getByRole('button', { name: /join room/i }))
+
+    expect(onJoin).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'DinoGuesser',
+        roomId: 'DINO99',
+        avatar: expect.objectContaining({
+          presetId: 'dino',
+        }),
+      })
+    )
+  })
+
+  it('preserves valid typed player name and selected avatar when invite URL is pasted into room code', async () => {
+    const user = userEvent.setup()
+    const onJoin = vi.fn()
+    render(<LobbyPage onCreate={vi.fn()} onJoin={onJoin} />)
+
+    // 1. Select an avatar (e.g. fox)
+    await user.click(screen.getByRole('radio', { name: /select fox avatar/i }))
+
+    // 2. Type a valid player name into name input
+    const nameInput = screen.getByLabelText(/your name/i)
+    await user.type(nameInput, 'CleverFox')
+
+    // 3. Paste full invite URL into room code field
+    const roomInput = screen.getByLabelText(/room code/i)
+    fireEvent.paste(roomInput, {
+      clipboardData: {
+        getData: (type: string) =>
+          type === 'text'
+            ? 'https://drawparty-staging-environment.firebaseapp.com/game/lobby?utm_source=invite&room=FX1234'
+            : '',
+      },
+    })
+
+    // Player name must remain preserved and NOT overwritten
+    expect(nameInput).toHaveValue('CleverFox')
+    expect(roomInput).toHaveValue(
+      'https://drawparty-staging-environment.firebaseapp.com/game/lobby?utm_source=invite&room=FX1234'
+    )
+
+    // 4. Click join room
+    const joinBtn = screen.getByRole('button', { name: /join room/i })
+    expect(joinBtn).toBeEnabled()
+    await user.click(joinBtn)
+
+    // 5. onJoin receives typed name, parsed room ID, and retained avatar
+    expect(onJoin).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'CleverFox',
+        roomId: 'FX1234',
+        avatar: expect.objectContaining({
+          presetId: 'fox',
+        }),
       })
     )
   })

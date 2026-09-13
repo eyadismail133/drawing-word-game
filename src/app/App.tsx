@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { GameBoard } from '../components/GameBoard'
 import { LobbyPage, type CreateRoomParams, type JoinRoomParams } from '../components/LobbyPage'
 import { RoomLobby } from '../components/RoomLobby'
 import { useAnonymousAuth } from '../features/auth/useAnonymousAuth'
@@ -44,11 +45,21 @@ export function App() {
   const {
     room,
     error: roomError,
+    roundSecret,
     createRoom,
     joinRoom,
     startGame,
     updateRoomSettings,
     leaveRoom,
+    chooseWord,
+    appendStroke,
+    clearCanvas,
+    sendGuess,
+    finishDrawing,
+    advanceRound,
+    replayGame,
+    returnToLobby,
+    serverTimeOffset,
     retry: retryRoom,
     clearError: clearRoomError,
   } = useRoomGame(roomId || null, userId)
@@ -99,7 +110,7 @@ export function App() {
     return () => window.removeEventListener('popstate', handlePopState)
   }, [roomId, leaveRoom, retryRoom, clearRoomError])
 
-  const handleCreateRoom = async ({ name, settings }: CreateRoomParams) => {
+  const handleCreateRoom = async ({ name, settings, avatar }: CreateRoomParams) => {
     ++navSeqRef.current
     setActionLoading(true)
     setActionError(null)
@@ -108,7 +119,7 @@ export function App() {
         localStorage.setItem('drawparty_player_name', name)
       } catch {}
       setStoredName(name)
-      const created = await createRoom(name, settings)
+      const created = await createRoom(name, settings, avatar)
       setRoomId(created.id)
       updateUrlRoomId(created.id)
     } catch (err) {
@@ -118,7 +129,7 @@ export function App() {
     }
   }
 
-  const handleJoinRoom = async ({ name, roomId: targetId }: JoinRoomParams) => {
+  const handleJoinRoom = async ({ name, roomId: targetId, avatar }: JoinRoomParams) => {
     ++navSeqRef.current
     setActionLoading(true)
     setActionError(null)
@@ -127,7 +138,7 @@ export function App() {
         localStorage.setItem('drawparty_player_name', name)
       } catch {}
       setStoredName(name)
-      await joinRoom(targetId, name)
+      await joinRoom(targetId, name, avatar)
       setRoomId(targetId)
       updateUrlRoomId(targetId)
     } catch (err) {
@@ -191,6 +202,17 @@ export function App() {
     }
   }
 
+  const handleSharedReturnToLobby = async () => {
+    setActionError(null)
+    try {
+      await returnToLobby()
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err : new Error('Failed to return to lobby')
+      )
+    }
+  }
+
   return (
     <div className="app-layout">
       <header className="app-header">
@@ -249,17 +271,21 @@ export function App() {
               onClearActionError={() => setActionError(null)}
             />
           ) : (
-            <div className="game-placeholder-card">
-              <h2>Game in Progress</h2>
-              <p>The game has started! Waiting for current round to complete...</p>
-              <button
-                type="button"
-                className="btn btn-secondary"
-                onClick={handleLeaveRoom}
-              >
-                Leave Room
-              </button>
-            </div>
+            <GameBoard
+              room={room}
+              currentUserId={userId!}
+              serverTimeOffset={serverTimeOffset}
+              roundSecret={roundSecret}
+              onChooseWord={chooseWord}
+              onAppendStroke={appendStroke}
+              onClearCanvas={clearCanvas}
+              onSendGuess={sendGuess}
+              onFinishDrawing={finishDrawing}
+              onAdvanceRound={advanceRound}
+              onReplayGame={replayGame}
+              onLeaveRoom={handleLeaveRoom}
+              onReturnToLobby={handleSharedReturnToLobby}
+            />
           )
         ) : (
           <>

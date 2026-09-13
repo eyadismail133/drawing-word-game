@@ -1,4 +1,5 @@
 import type { Player } from '../features/game/domain'
+import { AvatarGraphic } from './AvatarGraphic'
 
 export type PlayerListProps = {
   players: Record<string, Player> | Player[]
@@ -20,8 +21,13 @@ export function PlayerList({ players, hostId, currentUserId }: PlayerListProps) 
             key={player.id}
             className={`player-item ${player.connected ? 'is-online' : 'is-offline'}`}
           >
-            <div className="player-avatar" aria-hidden="true">
-              {player.name.charAt(0).toUpperCase()}
+            <div className="player-avatar">
+              <AvatarGraphic
+                avatar={player.avatar}
+                size={36}
+                seedId={player.id}
+                seedName={player.name}
+              />
             </div>
             <div className="player-info">
               <div className="player-name-row">
