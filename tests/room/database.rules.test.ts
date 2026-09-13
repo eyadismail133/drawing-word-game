@@ -830,4 +830,15 @@ describe('Realtime Database room rules', () => {
     expect(scoredRoom2.players[guesser2].score).toBe(500)
     expect(scoredRoom2.game.awards[game2TurnId]?.[guesser2]).toBe(true)
   })
+
+  it('validates settings.rounds: accepts 1, 2, 3, 5, 7 and rejects invalid rounds such as 4', async () => {
+    await repositoryFor('host').createRoom(room())
+
+    // Host updating rounds to 5 and 7 succeeds
+    await assertSucceeds(update(roomPath('host'), { 'settings/rounds': 5 }))
+    await assertSucceeds(update(roomPath('host'), { 'settings/rounds': 7 }))
+
+    // Host updating rounds to 4 is rejected
+    await assertFails(update(roomPath('host'), { 'settings/rounds': 4 }))
+  })
 })

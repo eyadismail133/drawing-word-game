@@ -8,7 +8,7 @@ export type CreateRoomParams = {
   name: string
   language: Language
   drawSeconds: 60 | 80 | 100
-  rounds: 1 | 2 | 3
+  rounds: 1 | 2 | 3 | 5 | 7
   settings: RoomSettings
   avatar?: Avatar
 }
@@ -46,7 +46,7 @@ export function LobbyPage({
   const [avatar, setAvatar] = useState<Avatar>(() => getSavedAvatar())
   const [language, setLanguage] = useState<Language>('english')
   const [drawSeconds, setDrawSeconds] = useState<60 | 80 | 100>(80)
-  const [rounds, setRounds] = useState<1 | 2 | 3>(3)
+  const [rounds, setRounds] = useState<1 | 2 | 3 | 5 | 7>(3)
   const [roomInput, setRoomInput] = useState<string>(initialRoomId)
 
   const handleAvatarChange = useCallback((newAvatar: Avatar) => {
@@ -212,9 +212,9 @@ export function LobbyPage({
                   onChange={(e) => setLanguage(e.target.value as Language)}
                   disabled={isLoading || isAuthPending}
                 >
-                  <option value="english">English (100 words)</option>
-                  <option value="arabic">العربية (100 كلمة)</option>
-                  <option value="mixed">Mixed / مختلط (200 words)</option>
+                  <option value="english">English (250 words)</option>
+                  <option value="arabic">العربية (250 كلمة)</option>
+                  <option value="mixed">Mixed / مختلط (500 words)</option>
                 </select>
               </div>
 
@@ -244,12 +244,14 @@ export function LobbyPage({
                     id={roundsId}
                     className="form-select"
                     value={rounds}
-                    onChange={(e) => setRounds(Number(e.target.value) as 1 | 2 | 3)}
+                    onChange={(e) => setRounds(Number(e.target.value) as 1 | 2 | 3 | 5 | 7)}
                     disabled={isLoading || isAuthPending}
                   >
                     <option value={1}>1 Round</option>
                     <option value={2}>2 Rounds</option>
                     <option value={3}>3 Rounds</option>
+                    <option value={5}>5 Rounds</option>
+                    <option value={7}>7 Rounds</option>
                   </select>
                 </div>
               </div>

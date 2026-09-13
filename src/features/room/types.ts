@@ -6,7 +6,7 @@ export type RoomStatus = 'lobby' | 'choosing' | 'drawing' | 'results' | 'finishe
 export type RoomSettings = {
   language: Language
   drawSeconds: 60 | 80 | 100
-  rounds: 1 | 2 | 3
+  rounds: 1 | 2 | 3 | 5 | 7
   maxPlayers: 10
 }
 

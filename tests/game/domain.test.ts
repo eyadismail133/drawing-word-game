@@ -52,17 +52,17 @@ const makeRoom = (players: Record<string, Player>): Room => ({
 })
 
 describe('Word Banks', () => {
-  it('ships exactly 100 words per language', () => {
-    expect(ENGLISH_WORDS).toHaveLength(100)
-    expect(ARABIC_WORDS).toHaveLength(100)
-    expect(ALL_WORDS).toHaveLength(200)
+  it('ships exactly 250 words per language and 500 total', () => {
+    expect(ENGLISH_WORDS).toHaveLength(250)
+    expect(ARABIC_WORDS).toHaveLength(250)
+    expect(ALL_WORDS).toHaveLength(500)
   })
 
   it('contains unique IDs and texts in English bank', () => {
     const ids = new Set(ENGLISH_WORDS.map((w) => w.id))
     const texts = new Set(ENGLISH_WORDS.map((w) => w.text.toLowerCase()))
-    expect(ids.size).toBe(100)
-    expect(texts.size).toBe(100)
+    expect(ids.size).toBe(250)
+    expect(texts.size).toBe(250)
 
     ENGLISH_WORDS.forEach((w, index) => {
       const padded = String(index + 1).padStart(3, '0')
@@ -75,8 +75,8 @@ describe('Word Banks', () => {
   it('contains unique IDs and texts in Arabic bank', () => {
     const ids = new Set(ARABIC_WORDS.map((w) => w.id))
     const texts = new Set(ARABIC_WORDS.map((w) => w.text))
-    expect(ids.size).toBe(100)
-    expect(texts.size).toBe(100)
+    expect(ids.size).toBe(250)
+    expect(texts.size).toBe(250)
 
     ARABIC_WORDS.forEach((w, index) => {
       const padded = String(index + 1).padStart(3, '0')

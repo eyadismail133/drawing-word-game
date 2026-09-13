@@ -229,4 +229,27 @@ describe('LobbyPage', () => {
       })
     )
   })
+
+  it('allows selecting 5 and 7 rounds for room creation', async () => {
+    const user = userEvent.setup()
+    const onCreate = vi.fn()
+    render(<LobbyPage onCreate={onCreate} onJoin={vi.fn()} />)
+    await user.type(screen.getByLabelText(/your name/i), 'Host')
+
+    await user.selectOptions(screen.getByLabelText(/rounds/i), '5')
+    await user.click(screen.getByRole('button', { name: /create room/i }))
+    expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ rounds: 5 }))
+
+    await user.selectOptions(screen.getByLabelText(/rounds/i), '7')
+    await user.click(screen.getByRole('button', { name: /create room/i }))
+    expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ rounds: 7 }))
+  })
+
+  it('displays updated word counts in language dropdown options', () => {
+    render(<LobbyPage onCreate={vi.fn()} onJoin={vi.fn()} />)
+    const languageSelect = screen.getByLabelText(/word language/i)
+    expect(languageSelect).toContainElement(screen.getByRole('option', { name: /english \(250 words\)/i }))
+    expect(languageSelect).toContainElement(screen.getByRole('option', { name: /العربية \(250 كلمة\)/i }))
+    expect(languageSelect).toContainElement(screen.getByRole('option', { name: /mixed \/ مختلط \(500 words\)/i }))
+  })
 })

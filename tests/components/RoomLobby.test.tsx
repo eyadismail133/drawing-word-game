@@ -214,4 +214,21 @@ describe('RoomLobby', () => {
     fireEvent.click(dismissBtn)
     expect(onClear).toHaveBeenCalledTimes(1)
   })
+
+  it('allows host to select 5 and 7 rounds', async () => {
+    const user = userEvent.setup()
+    const onUpdateSettings = vi.fn().mockResolvedValue(undefined)
+    render(<RoomLobby room={baseRoom} currentUserId="host-1" onUpdateSettings={onUpdateSettings} />)
+
+    const roundsSelect = screen.getByLabelText(/rounds/i)
+    await user.selectOptions(roundsSelect, '5')
+    expect(onUpdateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ rounds: 5 })
+    )
+
+    await user.selectOptions(roundsSelect, '7')
+    expect(onUpdateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ rounds: 7 })
+    )
+  })
 })

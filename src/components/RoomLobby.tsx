@@ -107,7 +107,7 @@ export function RoomLobby({
       setIsUpdating(true)
       await onUpdateSettings({
         ...room.settings,
-        rounds: Number(e.target.value) as 1 | 2 | 3,
+        rounds: Number(e.target.value) as 1 | 2 | 3 | 5 | 7,
       })
     } catch (err) {
       setInternalError(
@@ -266,6 +266,8 @@ export function RoomLobby({
                   <option value={1}>1 Round</option>
                   <option value={2}>2 Rounds</option>
                   <option value={3}>3 Rounds</option>
+                  <option value={5}>5 Rounds</option>
+                  <option value={7}>7 Rounds</option>
                 </select>
               </div>
             </div>
