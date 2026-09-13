@@ -1070,4 +1070,653 @@ describe('GameBoard component', () => {
       expect(robotAvatars.length).toBeGreaterThanOrEqual(1)
     })
   })
+
+  describe('Live Drawing Streaming & Latency Regression', () => {
+    beforeEach(() => {
+      if (typeof window !== 'undefined' && !window.PointerEvent) {
+        window.PointerEvent = MouseEvent as any
+      }
+    })
+
+    it('streams active gesture before pointer-up at <= 6 batches/sec with endpoint overlap and tail flush', async () => {
+      vi.useFakeTimers()
+      const mockAppendStroke = vi.fn().mockResolvedValue('stroke-id-1')
+
+      render(
+        <GameBoard
+          room={baseRoom}
+          currentUserId="host-1"
+          onAppendStroke={mockAppendStroke}
+        />
+      )
+
+      const canvas = screen.getByRole('img', { name: /drawing canvas/i })
+      vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+        left: 0,
+        top: 0,
+        width: 600,
+        height: 400,
+        right: 600,
+        bottom: 400,
+        x: 0,
+        y: 0,
+        toJSON: () => {},
+      })
+
+      // 1. Start pointer gesture at t=0
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 100, pointerId: 1 })
+      expect(mockAppendStroke).not.toHaveBeenCalled()
+
+      // 2. Advance time to 166ms interval
+      act(() => {
+        vi.advanceTimersByTime(166)
+      })
+
+      // 3. Move again
+      fireEvent.pointerMove(canvas, { clientX: 120, clientY: 120, pointerId: 1 })
+
+      // 4. Prove onAppendStroke is called BEFORE pointer-up
+      expect(mockAppendStroke).toHaveBeenCalledTimes(1)
+      const firstBatch = mockAppendStroke.mock.calls[0][0]
+      expect(firstBatch.turnId).toBe('turn-0')
+      expect(firstBatch.authorId).toBe('host-1')
+      expect(firstBatch.color).toBe('#0f172a')
+      expect(firstBatch.tool).toBe('pen')
+      expect(firstBatch.points).toEqual([
+        normalizePoint(100, 100, 600, 400),
+        normalizePoint(120, 120, 600, 400),
+      ])
+
+      // 5. Assert rate limiting: no more than six batches per second (interval >= 166ms)
+      // Rapid movements within interval (< 166ms) do not trigger additional calls
+      for (let i = 1; i <= 5; i++) {
+        await act(async () => {
+          vi.advanceTimersByTime(20)
+        })
+        fireEvent.pointerMove(canvas, { clientX: 120 + i * 5, clientY: 120 + i * 5, pointerId: 1 })
+      }
+      expect(mockAppendStroke).toHaveBeenCalledTimes(1)
+
+      // Advance by remaining time to reach next 166ms interval (100ms + 66ms = 166ms since last batch)
+      await act(async () => {
+        vi.advanceTimersByTime(66)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 160, clientY: 160, pointerId: 1 })
+      expect(mockAppendStroke).toHaveBeenCalledTimes(2)
+
+      // Batch 2 must overlap prior sent endpoint (last point of batch 1)
+      const secondBatch = mockAppendStroke.mock.calls[1][0]
+      const lastPointBatch1 = firstBatch.points[firstBatch.points.length - 1]
+      expect(secondBatch.points[0]).toEqual(lastPointBatch1)
+      expect(secondBatch.turnId).toBe('turn-0')
+      expect(secondBatch.authorId).toBe('host-1')
+
+      // Move over a full second (1000ms) with frequent moves and assert <= 6 batches per second
+      const callCountBeforeSecond = mockAppendStroke.mock.calls.length
+      for (let ms = 0; ms < 1000; ms += 25) {
+        await act(async () => {
+          vi.advanceTimersByTime(25)
+        })
+        fireEvent.pointerMove(canvas, { clientX: 160 + ms * 0.1, clientY: 160 + ms * 0.1, pointerId: 1 })
+      }
+      const batchesInSecond = mockAppendStroke.mock.calls.length - callCountBeforeSecond
+      expect(batchesInSecond).toBeLessThanOrEqual(6)
+
+      // 6. Move again slightly and release pointer-up: flushes only unsent tail points
+      const callCountBeforeTail = mockAppendStroke.mock.calls.length
+      const prevLastBatch = mockAppendStroke.mock.calls[callCountBeforeTail - 1][0]
+      const prevLastPoint = prevLastBatch.points[prevLastBatch.points.length - 1]
+
+      act(() => {
+        vi.advanceTimersByTime(30)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 280, clientY: 280, pointerId: 1 })
+
+      // Final pointer up flushes unsent tail point
+      fireEvent.pointerUp(canvas, { clientX: 280, clientY: 280, pointerId: 1 })
+      await act(async () => {
+        vi.advanceTimersByTime(166)
+      })
+
+      expect(mockAppendStroke).toHaveBeenCalledTimes(callCountBeforeTail + 1)
+      const tailBatch = mockAppendStroke.mock.calls[callCountBeforeTail][0]
+      // Tail batch overlaps previous endpoint and contains only unsent points
+      expect(tailBatch.points[0]).toEqual(prevLastPoint)
+      expect(tailBatch.points[tailBatch.points.length - 1]).toEqual(normalizePoint(280, 280, 600, 400))
+
+      vi.useRealTimers()
+    })
+
+    it('persists a quick tap or gesture shorter than interval without duplication', async () => {
+      const mockAppendStroke = vi.fn().mockResolvedValue('tap-stroke')
+      render(
+        <GameBoard
+          room={baseRoom}
+          currentUserId="host-1"
+          onAppendStroke={mockAppendStroke}
+        />
+      )
+
+      const canvas = screen.getByRole('img', { name: /drawing canvas/i })
+      vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+        left: 0,
+        top: 0,
+        width: 600,
+        height: 400,
+        right: 600,
+        bottom: 400,
+        x: 0,
+        y: 0,
+        toJSON: () => {},
+      })
+
+      // Tap at (50, 50)
+      fireEvent.pointerDown(canvas, { clientX: 50, clientY: 50, pointerId: 2 })
+      expect(mockAppendStroke).not.toHaveBeenCalled()
+      await act(async () => {
+        fireEvent.pointerUp(canvas, { clientX: 50, clientY: 50, pointerId: 2 })
+      })
+
+      expect(mockAppendStroke).toHaveBeenCalledTimes(1)
+      expect(mockAppendStroke.mock.calls[0][0].points).toHaveLength(1)
+      expect(mockAppendStroke.mock.calls[0][0].points[0]).toEqual(normalizePoint(50, 50, 600, 400))
+    })
+
+    it('serializes asynchronous stroke appends even if promises settle out of order', async () => {
+      vi.useFakeTimers()
+      const appendExecutionOrder: string[] = []
+      let resolveFirst: () => void
+      const firstPromise = new Promise<string>((resolve) => {
+        resolveFirst = () => {
+          appendExecutionOrder.push('batch-1-resolved')
+          resolve('b1')
+        }
+      })
+
+      const mockAppendStroke = vi.fn().mockImplementation((stroke) => {
+        if (stroke.points[0].x === normalizePoint(100, 100, 600, 400).x) {
+          appendExecutionOrder.push('batch-1-invoked')
+          return firstPromise
+        } else {
+          appendExecutionOrder.push('batch-2-invoked')
+          return Promise.resolve('b2')
+        }
+      })
+
+      render(
+        <GameBoard
+          room={baseRoom}
+          currentUserId="host-1"
+          onAppendStroke={mockAppendStroke}
+        />
+      )
+
+      const canvas = screen.getByRole('img', { name: /drawing canvas/i })
+      vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+        left: 0,
+        top: 0,
+        width: 600,
+        height: 400,
+        right: 600,
+        bottom: 400,
+        x: 0,
+        y: 0,
+        toJSON: () => {},
+      })
+
+      // Batch 1
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 100, pointerId: 1 })
+      act(() => {
+        vi.advanceTimersByTime(166)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 110, clientY: 110, pointerId: 1 })
+      expect(appendExecutionOrder).toEqual(['batch-1-invoked'])
+
+      // Batch 2 queued while batch 1 is still pending
+      act(() => {
+        vi.advanceTimersByTime(166)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 120, clientY: 120, pointerId: 1 })
+
+      // Batch 2 must wait for batch 1 to resolve before being invoked
+      expect(appendExecutionOrder).toEqual(['batch-1-invoked'])
+
+      // Resolve batch 1
+      await act(async () => {
+        resolveFirst!()
+      })
+
+      expect(appendExecutionOrder).toEqual(['batch-1-invoked', 'batch-1-resolved', 'batch-2-invoked'])
+      vi.useRealTimers()
+    })
+
+    it('enforces at least 166ms spacing between remote append invocations when earlier requests are slow', async () => {
+      vi.useFakeTimers()
+      const invocationTimestamps: number[] = []
+      let resolveFirstBatch: () => void
+      const firstBatchPromise = new Promise<string>((resolve) => {
+        resolveFirstBatch = () => resolve('batch-1-ok')
+      })
+
+      const mockAppendStroke = vi.fn().mockImplementation(() => {
+        invocationTimestamps.push(Date.now())
+        if (invocationTimestamps.length === 1) {
+          return firstBatchPromise
+        }
+        return Promise.resolve('subsequent-batch-ok')
+      })
+
+      render(
+        <GameBoard
+          room={baseRoom}
+          currentUserId="host-1"
+          onAppendStroke={mockAppendStroke}
+        />
+      )
+
+      const canvas = screen.getByRole('img', { name: /drawing canvas/i })
+      vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+        left: 0,
+        top: 0,
+        width: 600,
+        height: 400,
+        right: 600,
+        bottom: 400,
+        x: 0,
+        y: 0,
+        toJSON: () => {},
+      })
+
+      // Start gesture at t=0
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 100, pointerId: 1 })
+
+      // Advance to 166ms -> Batch 1 is dispatched
+      act(() => {
+        vi.advanceTimersByTime(166)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 110, clientY: 110, pointerId: 1 })
+      expect(mockAppendStroke).toHaveBeenCalledTimes(1)
+      expect(invocationTimestamps).toHaveLength(1)
+      const batch1Timestamp = invocationTimestamps[0]
+
+      // Queue Batch 2 while Batch 1 is still pending (at t = 332ms)
+      act(() => {
+        vi.advanceTimersByTime(166)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 120, clientY: 120, pointerId: 1 })
+
+      // Queue Batch 3 while Batch 1 is still pending (at t = 498ms)
+      act(() => {
+        vi.advanceTimersByTime(166)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 130, clientY: 130, pointerId: 1 })
+
+      // Only Batch 1 has been invoked so far because it is still pending
+      expect(mockAppendStroke).toHaveBeenCalledTimes(1)
+
+      // Resolve Batch 1 at t = 500ms (held promise resolves)
+      act(() => {
+        vi.advanceTimersByTime(2)
+      })
+      await act(async () => {
+        resolveFirstBatch!()
+      })
+
+      // Batch 2 should be dispatched now (500 - 166 = 334 >= 166ms since Batch 1)
+      expect(mockAppendStroke).toHaveBeenCalledTimes(2)
+      expect(invocationTimestamps).toHaveLength(2)
+      const batch2Timestamp = invocationTimestamps[1]
+      expect(batch2Timestamp - batch1Timestamp).toBeGreaterThanOrEqual(166)
+
+      // CRITICAL CHECK: Batch 3 must NOT be dispatched immediately even though Batch 2 resolved immediately!
+      expect(mockAppendStroke).toHaveBeenCalledTimes(2)
+
+      // Advance fake time by 100ms (< 166ms after Batch 2)
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+      // Batch 3 is still held in the queue waiting for the 166ms spacing
+      expect(mockAppendStroke).toHaveBeenCalledTimes(2)
+
+      // Advance remaining 66ms to reach the 166ms spacing after Batch 2
+      await act(async () => {
+        vi.advanceTimersByTime(66)
+      })
+      // Now Batch 3 is dispatched!
+      expect(mockAppendStroke).toHaveBeenCalledTimes(3)
+      expect(invocationTimestamps).toHaveLength(3)
+      const batch3Timestamp = invocationTimestamps[2]
+      expect(batch3Timestamp - batch2Timestamp).toBeGreaterThanOrEqual(166)
+
+      vi.useRealTimers()
+    })
+
+    it('ensures clear stays ordered between an in-flight delayed append and a new stroke', async () => {
+      vi.useFakeTimers()
+      const executionOrder: string[] = []
+      let resolveFirstBatch: () => void
+      const firstBatchPromise = new Promise<string>((resolve) => {
+        resolveFirstBatch = () => resolve('batch-1-ok')
+      })
+
+      const mockAppendStroke = vi.fn().mockImplementation(() => {
+        if (executionOrder.length === 0) {
+          executionOrder.push('stroke-1-invoked')
+          return firstBatchPromise
+        }
+        executionOrder.push('stroke-2-invoked')
+        return Promise.resolve('stroke-2-ok')
+      })
+
+      const mockClearCanvas = vi.fn().mockImplementation(() => {
+        executionOrder.push('clear-canvas-invoked')
+        return Promise.resolve()
+      })
+
+      render(
+        <GameBoard
+          room={baseRoom}
+          currentUserId="host-1"
+          onAppendStroke={mockAppendStroke}
+          onClearCanvas={mockClearCanvas}
+        />
+      )
+
+      const canvas = screen.getByRole('img', { name: /drawing canvas/i })
+      vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+        left: 0,
+        top: 0,
+        width: 600,
+        height: 400,
+        right: 600,
+        bottom: 400,
+        x: 0,
+        y: 0,
+        toJSON: () => {},
+      })
+
+      // Start gesture 1 at t=0
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 100, pointerId: 1 })
+
+      // Advance to 166ms -> Stroke 1 Batch 1 is dispatched
+      act(() => {
+        vi.advanceTimersByTime(166)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 110, clientY: 110, pointerId: 1 })
+      expect(executionOrder).toEqual(['stroke-1-invoked'])
+
+      // User clicks Clear while Stroke 1 is still in flight
+      const clearBtn = screen.getByRole('button', { name: /clear canvas/i })
+      fireEvent.click(clearBtn)
+
+      // Clear must NOT execute yet because Stroke 1 is still pending in flight
+      expect(mockClearCanvas).not.toHaveBeenCalled()
+      expect(executionOrder).toEqual(['stroke-1-invoked'])
+
+      // User starts Stroke 2 at t=200ms
+      act(() => {
+        vi.advanceTimersByTime(34) // 166 + 34 = 200ms
+      })
+      fireEvent.pointerDown(canvas, { clientX: 200, clientY: 200, pointerId: 1 })
+
+      // Advance to 366ms (200 + 166ms) -> Stroke 2 Batch 1 is ready to flush
+      act(() => {
+        vi.advanceTimersByTime(166)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 210, clientY: 210, pointerId: 1 })
+
+      // Still, only Stroke 1 has been invoked so far!
+      expect(executionOrder).toEqual(['stroke-1-invoked'])
+      expect(mockClearCanvas).not.toHaveBeenCalled()
+
+      // Now resolve Stroke 1 at t=370ms
+      act(() => {
+        vi.advanceTimersByTime(4)
+      })
+      await act(async () => {
+        resolveFirstBatch!()
+        executionOrder.push('stroke-1-resolved')
+      })
+
+      // When Stroke 1 resolves, Clear should execute immediately next (NOT Stroke 2!)
+      expect(executionOrder).toEqual([
+        'stroke-1-invoked',
+        'stroke-1-resolved',
+        'clear-canvas-invoked',
+      ])
+
+      // Stroke 2 must not be invoked yet because 166ms spacing is enforced after Clear!
+      expect(mockAppendStroke).toHaveBeenCalledTimes(1)
+
+      // Advance timers by 166ms for the queue to dispatch Stroke 2
+      await act(async () => {
+        vi.advanceTimersByTime(166)
+      })
+
+      // Stroke 2 is now invoked in strict order!
+      expect(executionOrder).toEqual([
+        'stroke-1-invoked',
+        'stroke-1-resolved',
+        'clear-canvas-invoked',
+        'stroke-2-invoked',
+      ])
+      expect(mockAppendStroke).toHaveBeenCalledTimes(2)
+
+      vi.useRealTimers()
+    })
+
+    it('preserves queue ownership during pointer-cancel so second append waits for in-flight append to settle and spacing permits it', async () => {
+      vi.useFakeTimers()
+      const executionOrder: string[] = []
+      let resolveFirstAppend: () => void
+      const firstAppendPromise = new Promise<string>((resolve) => {
+        resolveFirstAppend = () => resolve('append-1-ok')
+      })
+
+      const mockAppendStroke = vi.fn().mockImplementation(() => {
+        if (executionOrder.length === 0) {
+          executionOrder.push('append-1-invoked')
+          return firstAppendPromise
+        }
+        executionOrder.push('append-2-invoked')
+        return Promise.resolve('append-2-ok')
+      })
+
+      render(
+        <GameBoard
+          room={baseRoom}
+          currentUserId="host-1"
+          onAppendStroke={mockAppendStroke}
+        />
+      )
+
+      const canvas = screen.getByRole('img', { name: /drawing canvas/i })
+      vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+        left: 0,
+        top: 0,
+        width: 600,
+        height: 400,
+        right: 600,
+        bottom: 400,
+        x: 0,
+        y: 0,
+        toJSON: () => {},
+      })
+
+      // Gesture 1 starts at t=0
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 100, pointerId: 1 })
+
+      // Advance to 166ms -> Batch 1 of Gesture 1 is dispatched (held in-flight)
+      act(() => {
+        vi.advanceTimersByTime(166)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 110, clientY: 110, pointerId: 1 })
+      expect(mockAppendStroke).toHaveBeenCalledTimes(1)
+      expect(executionOrder).toEqual(['append-1-invoked'])
+
+      // Gesture 1 receives pointer-cancel while Batch 1 is still in-flight
+      fireEvent.pointerCancel(canvas)
+
+      // Starting Gesture 2 at t=200ms
+      act(() => {
+        vi.advanceTimersByTime(34) // 166 + 34 = 200ms
+      })
+      fireEvent.pointerDown(canvas, { clientX: 200, clientY: 200, pointerId: 2 })
+
+      // Advance to 366ms (166ms later in gesture 2) -> batch 2 would want to flush
+      act(() => {
+        vi.advanceTimersByTime(166)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 210, clientY: 210, pointerId: 2 })
+
+      // CRITICAL CHECK: Gesture 2 must NOT have invoked onAppendStroke yet because Gesture 1 is still in flight!
+      expect(mockAppendStroke).toHaveBeenCalledTimes(1)
+      expect(executionOrder).toEqual(['append-1-invoked'])
+
+      // Now resolve Gesture 1 at t=370ms
+      act(() => {
+        vi.advanceTimersByTime(4)
+      })
+      await act(async () => {
+        resolveFirstAppend!()
+        executionOrder.push('append-1-resolved')
+      })
+
+      // Since Date.now() is 370ms, which is 370 - 166 = 204ms >= 166ms since Gesture 1 was invoked,
+      // Gesture 2 is invoked now!
+      expect(mockAppendStroke).toHaveBeenCalledTimes(2)
+      expect(executionOrder).toEqual([
+        'append-1-invoked',
+        'append-1-resolved',
+        'append-2-invoked',
+      ])
+
+      vi.useRealTimers()
+    })
+
+    it('settles queued clear operations when pointer cancel occurs while append is in flight so isClearing does not remain stuck', async () => {
+      vi.useFakeTimers()
+      let resolveFirstAppend: () => void
+      const firstAppendPromise = new Promise<string>((resolve) => {
+        resolveFirstAppend = () => resolve('append-1-ok')
+      })
+
+      const mockAppendStroke = vi.fn().mockImplementation(() => {
+        return firstAppendPromise
+      })
+
+      const mockClearCanvas = vi.fn().mockResolvedValue(undefined)
+
+      render(
+        <GameBoard
+          room={baseRoom}
+          currentUserId="host-1"
+          onAppendStroke={mockAppendStroke}
+          onClearCanvas={mockClearCanvas}
+        />
+      )
+
+      const canvas = screen.getByRole('img', { name: /drawing canvas/i })
+      vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+        left: 0,
+        top: 0,
+        width: 600,
+        height: 400,
+        right: 600,
+        bottom: 400,
+        x: 0,
+        y: 0,
+        toJSON: () => {},
+      })
+
+      // Gesture 1 starts at t=0
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 100, pointerId: 1 })
+      act(() => {
+        vi.advanceTimersByTime(166)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 110, clientY: 110, pointerId: 1 })
+      expect(mockAppendStroke).toHaveBeenCalledTimes(1)
+
+      // Click Clear button while append is in flight
+      const clearBtn = screen.getByRole('button', { name: /clear canvas/i })
+      fireEvent.click(clearBtn)
+
+      // Clear button is disabled because isClearing is true
+      expect(clearBtn).toBeDisabled()
+
+      // Pointer cancel fires on canvas
+      await act(async () => {
+        fireEvent.pointerCancel(canvas)
+      })
+
+      // Queued clear operation was settled (rejected/cancelled) so isClearing is NO LONGER stuck!
+      expect(clearBtn).not.toBeDisabled()
+
+      // Resolve the in-flight append
+      await act(async () => {
+        resolveFirstAppend!()
+      })
+
+      // mockClearCanvas was not called since the clear was cancelled
+      expect(mockClearCanvas).not.toHaveBeenCalled()
+
+      vi.useRealTimers()
+    })
+
+    it('settles queued clear operations when component unmounts so clear promises do not hang', async () => {
+      vi.useFakeTimers()
+      let resolveFirstAppend: () => void
+      const firstAppendPromise = new Promise<string>((resolve) => {
+        resolveFirstAppend = () => resolve('append-1-ok')
+      })
+
+      const mockAppendStroke = vi.fn().mockImplementation(() => {
+        return firstAppendPromise
+      })
+
+      const { unmount } = render(
+        <GameBoard
+          room={baseRoom}
+          currentUserId="host-1"
+          onAppendStroke={mockAppendStroke}
+        />
+      )
+
+      const canvas = screen.getByRole('img', { name: /drawing canvas/i })
+      vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+        left: 0,
+        top: 0,
+        width: 600,
+        height: 400,
+        right: 600,
+        bottom: 400,
+        x: 0,
+        y: 0,
+        toJSON: () => {},
+      })
+
+      fireEvent.pointerDown(canvas, { clientX: 100, clientY: 100, pointerId: 1 })
+      act(() => {
+        vi.advanceTimersByTime(166)
+      })
+      fireEvent.pointerMove(canvas, { clientX: 110, clientY: 110, pointerId: 1 })
+
+      // Queue clear
+      const clearBtn = screen.getByRole('button', { name: /clear canvas/i })
+      fireEvent.click(clearBtn)
+      expect(clearBtn).toBeDisabled()
+
+      // Unmount component while append is in flight and clear is queued
+      act(() => {
+        unmount()
+      })
+
+      // Resolve in-flight append without error
+      await act(async () => {
+        resolveFirstAppend!()
+      })
+
+      vi.useRealTimers()
+    })
+  })
 })

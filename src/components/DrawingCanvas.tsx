@@ -28,6 +28,8 @@ export const BRUSH_SIZES = [
   { label: 'L', size: 14, name: 'Large' },
 ]
 
+export const STREAM_BATCH_INTERVAL_MS = 166
+
 export function normalizePoint(
   px: number,
   py: number,
@@ -72,6 +74,18 @@ export function DrawingCanvas({
   const [isClearing, setIsClearing] = useState<boolean>(false)
   const isDrawingRef = useRef<boolean>(false)
   const currentPointsRef = useRef<StrokePoint[]>([])
+  const lastBatchTimeRef = useRef<number>(0)
+  const lastSentIndexRef = useRef<number>(-1)
+  type QueueItem =
+    | { kind: 'stroke'; payload: Omit<Stroke, 'id' | 'createdAt'> }
+    | { kind: 'clear'; resolve: () => void; reject: (err: unknown) => void }
+
+  const isAppendingRef = useRef<boolean>(false)
+  const isInFlightRef = useRef<boolean>(false)
+  const pendingQueueRef = useRef<QueueItem[]>([])
+  const queueResolversRef = useRef<Array<() => void>>([])
+  const lastInvocationTimeRef = useRef<number>(0)
+  const dispatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const rawStrokeList: Stroke[] = useMemo(() => {
     return Array.isArray(strokes) ? strokes : Object.values(strokes ?? {})
@@ -193,10 +207,191 @@ export function DrawingCanvas({
   const getCanvasPoint = (e: PointerEvent<HTMLCanvasElement>): StrokePoint => {
     const canvas = canvasRef.current!
     const rect = canvas.getBoundingClientRect()
-    const px = e.clientX - rect.left
-    const py = e.clientY - rect.top
+    const clientX = typeof e.clientX === 'number' && !Number.isNaN(e.clientX) ? e.clientX : 0
+    const clientY = typeof e.clientY === 'number' && !Number.isNaN(e.clientY) ? e.clientY : 0
+    const px = clientX - rect.left
+    const py = clientY - rect.top
     return normalizePoint(px, py, rect.width, rect.height)
   }
+
+  useEffect(() => {
+    return () => {
+      if (dispatchTimerRef.current) {
+        clearTimeout(dispatchTimerRef.current)
+        dispatchTimerRef.current = null
+      }
+      const items = pendingQueueRef.current
+      pendingQueueRef.current = []
+      items.forEach((item) => {
+        if (item.kind === 'clear') {
+          item.reject(new Error('DrawingCanvas unmounted'))
+        }
+      })
+      const resolvers = queueResolversRef.current
+      queueResolversRef.current = []
+      resolvers.forEach((res) => res())
+    }
+  }, [])
+
+  const processAppendQueue = useCallback(() => {
+    if (isAppendingRef.current) return
+    isAppendingRef.current = true
+
+    const executeNext = () => {
+      dispatchTimerRef.current = null
+      if (pendingQueueRef.current.length === 0) {
+        isInFlightRef.current = false
+        isAppendingRef.current = false
+        const resolvers = queueResolversRef.current
+        queueResolversRef.current = []
+        resolvers.forEach((res) => res())
+        return
+      }
+
+      const nextItem = pendingQueueRef.current.shift()!
+      lastInvocationTimeRef.current = Date.now()
+      isInFlightRef.current = true
+
+      if (nextItem.kind === 'stroke') {
+        if (!onAppendStroke) {
+          isInFlightRef.current = false
+          scheduleNext()
+          return
+        }
+
+        let promise: Promise<unknown>
+        try {
+          const res = onAppendStroke(nextItem.payload)
+          promise = res instanceof Promise ? res : Promise.resolve(res)
+        } catch {
+          renderAllStrokes()
+          promise = Promise.resolve()
+        }
+
+        promise
+          .catch(() => {
+            renderAllStrokes()
+          })
+          .finally(() => {
+            isInFlightRef.current = false
+            scheduleNext()
+          })
+      } else {
+        // nextItem.kind === 'clear'
+        let clearPromise: Promise<unknown>
+        try {
+          if (onClearCanvas) {
+            const res = onClearCanvas()
+            clearPromise = res instanceof Promise ? res : Promise.resolve(res)
+          } else if (onAppendStroke) {
+            const res = onAppendStroke({
+              authorId: currentUserId,
+              turnId: currentTurnId,
+              tool: 'clear',
+              points: [],
+              color: '#ffffff',
+              size: 0,
+            })
+            clearPromise = res instanceof Promise ? res : Promise.resolve(res)
+          } else {
+            clearPromise = Promise.resolve()
+          }
+        } catch (err) {
+          clearPromise = Promise.reject(err)
+        }
+
+        clearPromise
+          .then(() => {
+            nextItem.resolve()
+          })
+          .catch((err) => {
+            renderAllStrokes()
+            nextItem.reject(err)
+          })
+          .finally(() => {
+            isInFlightRef.current = false
+            scheduleNext()
+          })
+      }
+    }
+
+    const scheduleNext = () => {
+      if (pendingQueueRef.current.length === 0) {
+        isInFlightRef.current = false
+        isAppendingRef.current = false
+        const resolvers = queueResolversRef.current
+        queueResolversRef.current = []
+        resolvers.forEach((res) => res())
+        return
+      }
+
+      const nextItem = pendingQueueRef.current[0]
+      const now = Date.now()
+      const elapsed = now - lastInvocationTimeRef.current
+      const remainingDelay = STREAM_BATCH_INTERVAL_MS - elapsed
+
+      if (nextItem.kind === 'stroke' && lastInvocationTimeRef.current > 0 && remainingDelay > 0) {
+        dispatchTimerRef.current = setTimeout(executeNext, remainingDelay)
+      } else {
+        executeNext()
+      }
+    }
+
+    scheduleNext()
+  }, [onAppendStroke, onClearCanvas, currentUserId, currentTurnId, renderAllStrokes])
+
+  const enqueueAppend = useCallback(
+    (strokePayload: Omit<Stroke, 'id' | 'createdAt'>) => {
+      pendingQueueRef.current.push({ kind: 'stroke', payload: strokePayload })
+      processAppendQueue()
+    },
+    [processAppendQueue]
+  )
+
+  const enqueueClear = useCallback((): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      pendingQueueRef.current.push({ kind: 'clear', resolve, reject })
+      processAppendQueue()
+    })
+  }, [processAppendQueue])
+
+  const waitForAppendQueue = useCallback((): Promise<void> => {
+    if (!isAppendingRef.current && pendingQueueRef.current.length === 0) {
+      return Promise.resolve()
+    }
+    return new Promise((resolve) => {
+      queueResolversRef.current.push(resolve)
+    })
+  }, [])
+
+  const flushBatch = useCallback(() => {
+    if (!onAppendStroke) return
+    const allPoints = currentPointsRef.current
+    if (allPoints.length === 0) return
+
+    const lastSentIndex = lastSentIndexRef.current
+    const hasUnsentPoints = allPoints.length - 1 > lastSentIndex
+    if (!hasUnsentPoints) return
+
+    let batchPoints: StrokePoint[]
+    if (lastSentIndex < 0) {
+      batchPoints = allPoints.slice(0)
+    } else {
+      batchPoints = allPoints.slice(lastSentIndex)
+    }
+
+    lastSentIndexRef.current = allPoints.length - 1
+    lastBatchTimeRef.current = Date.now()
+
+    enqueueAppend({
+      turnId: currentTurnId,
+      points: batchPoints,
+      color: tool === 'eraser' ? '#ffffff' : color,
+      size,
+      tool,
+      authorId: currentUserId,
+    })
+  }, [currentTurnId, tool, color, size, currentUserId, onAppendStroke, enqueueAppend])
 
   const handlePointerDown = (e: PointerEvent<HTMLCanvasElement>) => {
     if (!isDrawer || disabled || !onAppendStroke) return
@@ -208,6 +403,8 @@ export function DrawingCanvas({
 
     const point = getCanvasPoint(e)
     currentPointsRef.current = [point]
+    lastSentIndexRef.current = -1
+    lastBatchTimeRef.current = Date.now()
 
     const ctx = canvas.getContext('2d')
     if (ctx) {
@@ -247,6 +444,11 @@ export function DrawingCanvas({
       ctx.lineTo(to.x, to.y)
       ctx.stroke()
     }
+
+    const now = Date.now()
+    if (now - lastBatchTimeRef.current >= STREAM_BATCH_INTERVAL_MS) {
+      flushBatch()
+    }
   }
 
   const handlePointerUp = async (e: PointerEvent<HTMLCanvasElement>) => {
@@ -260,37 +462,59 @@ export function DrawingCanvas({
       } catch {}
     }
 
-    const points = currentPointsRef.current
+    flushBatch()
     currentPointsRef.current = []
+    lastSentIndexRef.current = -1
 
-    if (points.length > 0 && onAppendStroke) {
-      try {
-        await onAppendStroke({
-          turnId: currentTurnId,
-          points,
-          color: tool === 'eraser' ? '#ffffff' : color,
-          size,
-          tool,
-          authorId: currentUserId,
-        })
-      } catch {
-        // Fallback: re-render strokes from repository
-        renderAllStrokes()
-      }
+    try {
+      await waitForAppendQueue()
+    } catch {
+      renderAllStrokes()
     }
   }
 
   const handlePointerCancel = () => {
     isDrawingRef.current = false
     currentPointsRef.current = []
+    lastSentIndexRef.current = -1
+
+    // Settle any queued clear operations so isClearing cannot remain stuck
+    const clearItems: Array<Extract<QueueItem, { kind: 'clear' }>> = []
+    pendingQueueRef.current = pendingQueueRef.current.filter((item) => {
+      if (item.kind === 'clear') {
+        clearItems.push(item)
+        return false
+      }
+      return false // Discard not-yet-dispatched stroke work from the cancelled gesture
+    })
+    clearItems.forEach((item) => {
+      item.reject(new Error('Clear cancelled by pointer cancel'))
+    })
+
+    // If no request is in flight, clear timer and mark pipeline idle.
+    // If a request is in flight, preserve strict queue ownership (isAppendingRef remains true)
+    // so subsequent gestures do not launch concurrent appends and old completion
+    // correctly schedules newer queue items.
+    if (!isInFlightRef.current) {
+      if (dispatchTimerRef.current) {
+        clearTimeout(dispatchTimerRef.current)
+        dispatchTimerRef.current = null
+      }
+      isAppendingRef.current = false
+      const resolvers = queueResolversRef.current
+      queueResolversRef.current = []
+      resolvers.forEach((res) => res())
+    }
+
     renderAllStrokes()
   }
 
   const handleClear = async () => {
     if (disabled || !isDrawer || isClearing) return
     setIsClearing(true)
-    currentPointsRef.current = []
     isDrawingRef.current = false
+    currentPointsRef.current = []
+    lastSentIndexRef.current = -1
 
     const canvas = canvasRef.current
     if (canvas) {
@@ -302,18 +526,9 @@ export function DrawingCanvas({
     }
 
     try {
-      if (onClearCanvas) {
-        await onClearCanvas()
-      } else if (onAppendStroke) {
-        await onAppendStroke({
-          authorId: currentUserId,
-          turnId: currentTurnId,
-          tool: 'clear',
-          points: [],
-          color: '#ffffff',
-          size: 0,
-        })
-      }
+      await enqueueClear()
+    } catch {
+      renderAllStrokes()
     } finally {
       setIsClearing(false)
     }
