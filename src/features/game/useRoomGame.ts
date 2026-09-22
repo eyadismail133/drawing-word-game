@@ -599,47 +599,6 @@ export function useRoomGame(
     activeRoom?.players ? Object.keys(activeRoom.players).sort().join(',') : '',
   ])
 
-  const inFlightAwardsRef = useRef<Record<string, boolean>>({})
-
-  // Host automatically awards points when a player is adjudicated correct (exactly once per player per turn)
-  useEffect(() => {
-    if (
-      !roomId ||
-      !userId ||
-      !activeRoom ||
-      activeRoom.hostId !== userId ||
-      !activeRoom.game.turnId
-    ) {
-      return
-    }
-
-    const turnId = activeRoom.game.turnId
-    const correctGuesserIds = activeRoom.game.correctGuesserIds[turnId] ?? {}
-    const awards = activeRoom.game.awards[turnId] ?? {}
-
-    for (const playerId of Object.keys(correctGuesserIds)) {
-      const awardKey = `${turnId}:${playerId}`
-      if (!awards[playerId] && !inFlightAwardsRef.current[awardKey]) {
-        inFlightAwardsRef.current[awardKey] = true
-        loadDatabase()
-          .then((db) => {
-            const repository = createRoomRepository(db)
-            return repository.awardCorrectGuess(roomId, userId, playerId)
-          })
-          .catch(() => {
-            delete inFlightAwardsRef.current[awardKey]
-          })
-      }
-    }
-  }, [
-    roomId,
-    userId,
-    activeRoom?.hostId,
-    activeRoom?.game.turnId,
-    activeRoom?.game.correctGuesserIds,
-    activeRoom?.game.awards,
-  ])
-
   // Active drawer progressively updates word hint letters as drawing time elapses
   useEffect(() => {
     if (

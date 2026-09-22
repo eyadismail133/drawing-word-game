@@ -4,7 +4,6 @@ import {
   onValue,
   push,
   ref,
-  runTransaction,
   serverTimestamp,
   set,
   update,
@@ -275,30 +274,90 @@ export const createRoomRepository = (database: Database) => {
 
   const adjudicateGuess = async (roomId: string, playerId: string): Promise<boolean> => {
     const room = await readRoom(roomId)
-    if (!room?.game.turnId || room.status !== 'drawing' || isRoundExpired(room, serverNow(database))) return false
+    const turnId = room?.game.turnId
+    if (
+      !room ||
+      !turnId ||
+      room.status !== 'drawing' ||
+      isRoundExpired(room, serverNow(database)) ||
+      room.game.drawerId === playerId ||
+      !room.players[playerId]
+    ) return false
+
+    if (
+      room.game.correctGuesserIds[turnId]?.[playerId] ||
+      room.game.awards[turnId]?.[playerId]
+    ) return false
 
     const secret = (await get(secretRef(roomId))).val() as { answer?: Word } | null
-    const guess = (await get(ref(database, `roomGuesses/${roomId}/${room.game.turnId}/${playerId}`))).val() as { text?: string } | null
+    const guess = (await get(ref(database, `roomGuesses/${roomId}/${turnId}/${playerId}`))).val() as { text?: string } | null
     if (!secret?.answer || !guess?.text || !isCorrectGuess(guess.text, secret.answer.text)) return false
 
-    const marker = await runTransaction(
-      ref(database, `rooms/${roomId}/game/correctGuesserIds/${room.game.turnId}/${playerId}`),
-      value => value || true,
-    )
-    if (!marker.committed) return false
+    const secondsLeft = Math.max(0, Math.ceil(((room.game.phaseEndsAt ?? serverNow(database)) - serverNow(database)) / 1_000))
+    const points = scoreGuess(secondsLeft, room.settings.drawSeconds)
+    const currentScore = room.players[playerId].score ?? 0
 
-    const updatedRoom = await readRoom(roomId)
-    if (!updatedRoom) return true
+    // Step 1: Commit marker, award, and score together atomically.
+    // The round-completion decision must not be able to veto a valid score.
+    const scoreUpdates: Record<string, unknown> = {
+      [`game/correctGuesserIds/${turnId}/${playerId}`]: true,
+      [`game/awards/${turnId}/${playerId}`]: true,
+      [`players/${playerId}/score`]: currentScore + points,
+    }
 
-    if (allConnectedGuessersAreCorrect(updatedRoom)) {
-      const updates: Record<string, unknown> = {
+    try {
+      await update(roomRef(roomId), scoreUpdates)
+    } catch (error) {
+      // Suppress only a verified duplicate (if another concurrent adjudication already awarded points)
+      const latestRoom = await readRoom(roomId)
+      if (latestRoom?.game.awards[turnId]?.[playerId]) {
+        return false
+      }
+      // Propagate unexpected failures
+      throw error
+    }
+
+    // Step 2: Read current state and attempt results transition separately.
+    // If presence changed before results transition, leave the round in drawing with points already awarded.
+    // Retry completion in a bounded way if the round remains drawing and all eligible players are correct.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const currentRoom = await readRoom(roomId)
+      if (!currentRoom || currentRoom.status !== 'drawing' || currentRoom.game.turnId !== turnId) {
+        // Verified benign: turn already completed or advanced
+        break
+      }
+      if (!allConnectedGuessersAreCorrect(currentRoom)) {
+        // Verified benign: a connected unguessed player now prevents completion
+        break
+      }
+
+      const resultsUpdates: Record<string, unknown> = {
         status: 'results',
       }
-      if (secret?.answer) {
-        updates['game/revealedAnswer'] = secret.answer
+      if (secret.answer) {
+        resultsUpdates['game/revealedAnswer'] = secret.answer
       }
-      await update(roomRef(roomId), updates)
+
+      try {
+        await update(roomRef(roomId), resultsUpdates)
+        break
+      } catch (err) {
+        const verifiedRoom = await readRoom(roomId)
+        if (!verifiedRoom || verifiedRoom.status !== 'drawing' || verifiedRoom.game.turnId !== turnId) {
+          // Verified benign: turn completed or advanced
+          break
+        }
+        if (!allConnectedGuessersAreCorrect(verifiedRoom)) {
+          // Verified benign: presence change prevents completion
+          break
+        }
+        if (attempt === 2) {
+          // Exhausted bounded retries while in an unexpected stuck state -> propagate error
+          throw err
+        }
+      }
     }
+
     return true
   }
 
@@ -309,7 +368,7 @@ export const createRoomRepository = (database: Database) => {
       !room ||
       !turnId ||
       room.hostId !== hostId ||
-      !room.players[playerId]?.connected ||
+      !room.players[playerId] ||
       !currentCorrectIds(room)[playerId] ||
       room.game.awards?.[turnId]?.[playerId]
     ) return

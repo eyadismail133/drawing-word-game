@@ -841,4 +841,236 @@ describe('Realtime Database room rules', () => {
     // Host updating rounds to 4 is rejected
     await assertFails(update(roomPath('host'), { 'settings/rounds': 4 }))
   })
+
+  it('awards score for a correct guess directly during adjudication without any host effect', async () => {
+    await repositoryFor('host').createRoom(room())
+    await repositoryFor('guest').joinRoom(roomId, player('guest'))
+    await repositoryFor('host').startGame(roomId, 'host', [word])
+    const r = (await repositoryFor('host').getRoom(roomId))!
+    const drawerId = r.game.drawerId!
+    const guesserId = drawerId === 'host' ? 'guest' : 'host'
+    await repositoryFor(drawerId).chooseWord(roomId, drawerId, word)
+
+    await repositoryFor(guesserId).sendGuess(roomId, guesserId, 'cat')
+    const adjudicated = await repositoryFor(drawerId).adjudicateGuess(roomId, guesserId)
+    expect(adjudicated).toBe(true)
+
+    // Verification WITHOUT calling awardCorrectGuess or relying on host effect
+    const roomAfter = (await repositoryFor('host').getRoom(roomId))!
+    const turnId = roomAfter.game.turnId!
+    expect(roomAfter.players[guesserId].score).toBe(500)
+    expect(roomAfter.game.correctGuesserIds[turnId]?.[guesserId]).toBe(true)
+    expect(roomAfter.game.awards[turnId]?.[guesserId]).toBe(true)
+  })
+
+  it('ensures repeated adjudication cannot duplicate points', async () => {
+    await repositoryFor('host').createRoom(room())
+    await repositoryFor('guest-1').joinRoom(roomId, player('guest-1'))
+    await repositoryFor('guest-2').joinRoom(roomId, player('guest-2'))
+    await repositoryFor('host').startGame(roomId, 'host', [word])
+    const r = (await repositoryFor('host').getRoom(roomId))!
+    const drawerId = r.game.drawerId!
+    const [guesser1] = ['host', 'guest-1', 'guest-2'].filter((id) => id !== drawerId)
+    await repositoryFor(drawerId).chooseWord(roomId, drawerId, word)
+
+    await repositoryFor(guesser1).sendGuess(roomId, guesser1, 'cat')
+    await repositoryFor(drawerId).adjudicateGuess(roomId, guesser1)
+
+    const roomFirst = (await repositoryFor('host').getRoom(roomId))!
+    const initialScore = roomFirst.players[guesser1].score
+    expect(initialScore).toBeGreaterThan(0)
+
+    // Repeated adjudication call
+    await repositoryFor(drawerId).adjudicateGuess(roomId, guesser1)
+
+    const roomSecond = (await repositoryFor('host').getRoom(roomId))!
+    expect(roomSecond.players[guesser1].score).toBe(initialScore)
+  })
+
+  it('earns nothing for a wrong guess and does not award points', async () => {
+    await repositoryFor('host').createRoom(room())
+    await repositoryFor('guest').joinRoom(roomId, player('guest'))
+    await repositoryFor('host').startGame(roomId, 'host', [word])
+    const r = (await repositoryFor('host').getRoom(roomId))!
+    const drawerId = r.game.drawerId!
+    const guesserId = drawerId === 'host' ? 'guest' : 'host'
+    const turnId = r.game.turnId!
+    await repositoryFor(drawerId).chooseWord(roomId, drawerId, word)
+
+    await repositoryFor(guesserId).sendGuess(roomId, guesserId, 'elephant')
+    const adjudicated = await repositoryFor(drawerId).adjudicateGuess(roomId, guesserId)
+    expect(adjudicated).toBe(false)
+
+    const roomAfter = (await repositoryFor('host').getRoom(roomId))!
+    expect(roomAfter.players[guesserId].score).toBe(0)
+    expect(roomAfter.game.correctGuesserIds[turnId]?.[guesserId]).toBeUndefined()
+    expect(roomAfter.game.awards[turnId]?.[guesserId]).toBeUndefined()
+  })
+
+  it('ensures the last correct guess still scores even when it ends the round', async () => {
+    await repositoryFor('host').createRoom(room())
+    await repositoryFor('guest-1').joinRoom(roomId, player('guest-1'))
+    await repositoryFor('guest-2').joinRoom(roomId, player('guest-2'))
+    await repositoryFor('host').startGame(roomId, 'host', [word])
+    const r = (await repositoryFor('host').getRoom(roomId))!
+    const drawerId = r.game.drawerId!
+    const [guesser1, guesser2] = ['host', 'guest-1', 'guest-2'].filter((id) => id !== drawerId)
+    const turnId = r.game.turnId!
+    await repositoryFor(drawerId).chooseWord(roomId, drawerId, word)
+
+    // First guesser guesses
+    await repositoryFor(guesser1).sendGuess(roomId, guesser1, 'cat')
+    await repositoryFor(drawerId).adjudicateGuess(roomId, guesser1)
+
+    const roomMid = (await repositoryFor('host').getRoom(roomId))!
+    expect(roomMid.status).toBe('drawing')
+    expect(roomMid.players[guesser1].score).toBe(500)
+
+    // Second (and final) guesser guesses -> this ends the round
+    await repositoryFor(guesser2).sendGuess(roomId, guesser2, 'cat')
+    await repositoryFor(drawerId).adjudicateGuess(roomId, guesser2)
+
+    const roomFinal = (await repositoryFor('host').getRoom(roomId))!
+    expect(roomFinal.status).toBe('results')
+    expect(roomFinal.game.revealedAnswer?.text).toBe('cat')
+    expect(roomFinal.players[guesser2].score).toBe(500)
+    expect(roomFinal.game.awards[turnId]?.[guesser2]).toBe(true)
+    expect(roomFinal.game.correctGuesserIds[turnId]?.[guesser2]).toBe(true)
+  })
+
+  it('enforces rule isolation: rejects results transition when unguessed player is connected but permits atomic score and marker commit', async () => {
+    await repositoryFor('host').createRoom(room())
+    await repositoryFor('guest-1').joinRoom(roomId, player('guest-1'))
+    await repositoryFor('guest-2').joinRoom(roomId, player('guest-2'))
+    await repositoryFor('host').startGame(roomId, 'host', [word])
+    const r = (await repositoryFor('host').getRoom(roomId))!
+    const drawerId = r.game.drawerId!
+    const [guesser1, guesser2] = ['host', 'guest-1', 'guest-2'].filter((id) => id !== drawerId)
+    const turnId = r.game.turnId!
+    await repositoryFor(drawerId).chooseWord(roomId, drawerId, word)
+
+    // Both guesser1 and guesser2 are connected, and neither has guessed yet.
+    // 1. Direct results transition while guessers are unguessed MUST fail security rules.
+    await assertFails(update(roomPath(drawerId), { status: 'results' }))
+
+    // 2. Bundling results transition with guesser1's score MUST fail security rules.
+    // (This was the exact flaw in the prior atomic update when precomputed completion raced with presence).
+    await assertFails(update(roomPath(drawerId), {
+      status: 'results',
+      [`game/correctGuesserIds/${turnId}/${guesser1}`]: true,
+      [`game/awards/${turnId}/${guesser1}`]: true,
+      [`players/${guesser1}/score`]: 500,
+    }))
+
+    // 3. Isolated atomic score and markers commit MUST succeed even when guesser2 has not guessed.
+    await assertSucceeds(update(roomPath(drawerId), {
+      [`game/correctGuesserIds/${turnId}/${guesser1}`]: true,
+      [`game/awards/${turnId}/${guesser1}`]: true,
+      [`players/${guesser1}/score`]: 500,
+    }))
+
+    // Verify guesser1's score is committed in database
+    const roomAfterScore = (await repositoryFor('host').getRoom(roomId))!
+    expect(roomAfterScore.players[guesser1].score).toBe(500)
+    expect(roomAfterScore.status).toBe('drawing')
+
+    // 4. Standalone results transition still fails while guesser2 remains unguessed.
+    await assertFails(update(roomPath(drawerId), { status: 'results' }))
+
+    // 5. Guesser2 also receives marker, award, and score.
+    await assertSucceeds(update(roomPath(drawerId), {
+      [`game/correctGuesserIds/${turnId}/${guesser2}`]: true,
+      [`game/awards/${turnId}/${guesser2}`]: true,
+      [`players/${guesser2}/score`]: 500,
+    }))
+
+    // 6. Now that all connected guessers are correct, results transition MUST succeed.
+    await assertSucceeds(update(roomPath(drawerId), {
+      status: 'results',
+      'game/revealedAnswer': word,
+    }))
+
+    // 7. Concurrent / repeated results transition is idempotent (data.val() === 'results' && newData.val() === 'results').
+    await assertSucceeds(update(roomPath(drawerId), { status: 'results' }))
+
+    const finalRoom = (await repositoryFor('host').getRoom(roomId))!
+    expect(finalRoom.status).toBe('results')
+    expect(finalRoom.players[guesser1].score).toBe(500)
+    expect(finalRoom.players[guesser2].score).toBe(500)
+  })
+
+  it('awards score when a reconnecting player is active and preserves round in drawing until all connected players guess', async () => {
+    await repositoryFor('host').createRoom(room())
+    await repositoryFor('guest-1').joinRoom(roomId, player('guest-1'))
+    await repositoryFor('guest-2').joinRoom(roomId, player('guest-2'))
+    await repositoryFor('host').startGame(roomId, 'host', [word])
+    const r = (await repositoryFor('host').getRoom(roomId))!
+    const drawerId = r.game.drawerId!
+    const [guesser1, guesser2] = ['host', 'guest-1', 'guest-2'].filter((id) => id !== drawerId)
+    const turnId = r.game.turnId!
+    await repositoryFor(drawerId).chooseWord(roomId, drawerId, word)
+
+    // guesser2 goes offline
+    await repositoryFor(guesser2).setPlayerPresence(roomId, guesser2, false)
+
+    // guesser1 submits correct guess
+    await repositoryFor(guesser1).sendGuess(roomId, guesser1, 'cat')
+
+    // guesser2 reconnects
+    await repositoryFor(guesser2).setPlayerPresence(roomId, guesser2, true)
+
+    // Adjudicate guesser1 with guesser2 reconnected: guesser1 gets score and round remains drawing
+    const adjudicated1 = await repositoryFor(drawerId).adjudicateGuess(roomId, guesser1)
+    expect(adjudicated1).toBe(true)
+
+    const roomMid = (await repositoryFor('host').getRoom(roomId))!
+    expect(roomMid.players[guesser1].score).toBe(500)
+    expect(roomMid.game.awards[turnId]?.[guesser1]).toBe(true)
+    expect(roomMid.status).toBe('drawing')
+
+    // guesser2 now submits guess and is adjudicated, completing the round
+    await repositoryFor(guesser2).sendGuess(roomId, guesser2, 'cat')
+    const adjudicated2 = await repositoryFor(drawerId).adjudicateGuess(roomId, guesser2)
+    expect(adjudicated2).toBe(true)
+
+    const roomFinal = (await repositoryFor('host').getRoom(roomId))!
+    expect(roomFinal.players[guesser2].score).toBe(500)
+    expect(roomFinal.game.awards[turnId]?.[guesser2]).toBe(true)
+    expect(roomFinal.status).toBe('results')
+    expect(roomFinal.game.revealedAnswer?.text).toBe('cat')
+  })
+
+
+  it('reconciles simultaneous correct guesses so both earn points and the round completes to results', async () => {
+    await repositoryFor('host').createRoom(room())
+    await repositoryFor('guest-1').joinRoom(roomId, player('guest-1'))
+    await repositoryFor('guest-2').joinRoom(roomId, player('guest-2'))
+    await repositoryFor('host').startGame(roomId, 'host', [word])
+    const r = (await repositoryFor('host').getRoom(roomId))!
+    const drawerId = r.game.drawerId!
+    const [guesser1, guesser2] = ['host', 'guest-1', 'guest-2'].filter((id) => id !== drawerId)
+    const turnId = r.game.turnId!
+    await repositoryFor(drawerId).chooseWord(roomId, drawerId, word)
+
+    // Both guessers send correct guesses
+    await repositoryFor(guesser1).sendGuess(roomId, guesser1, 'cat')
+    await repositoryFor(guesser2).sendGuess(roomId, guesser2, 'cat')
+
+    // Simultaneous adjudication
+    const [res1, res2] = await Promise.all([
+      repositoryFor(drawerId).adjudicateGuess(roomId, guesser1),
+      repositoryFor(drawerId).adjudicateGuess(roomId, guesser2),
+    ])
+
+    expect(res1).toBe(true)
+    expect(res2).toBe(true)
+
+    const finalRoom = (await repositoryFor('host').getRoom(roomId))!
+    expect(finalRoom.players[guesser1].score).toBe(500)
+    expect(finalRoom.players[guesser2].score).toBe(500)
+    expect(finalRoom.game.awards[turnId]?.[guesser1]).toBe(true)
+    expect(finalRoom.game.awards[turnId]?.[guesser2]).toBe(true)
+    expect(finalRoom.status).toBe('results')
+    expect(finalRoom.game.revealedAnswer?.text).toBe('cat')
+  })
 })
