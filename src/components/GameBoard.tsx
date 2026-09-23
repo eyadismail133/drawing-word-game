@@ -279,9 +279,16 @@ export function GameBoard({
                   <strong className="word-highlight">{answerText}</strong>
                 </div>
               ) : hasGuessedCorrectly ? (
-                <div className="guesser-word-correct" dir={isAnswerArabic ? 'rtl' : 'ltr'}>
+                <div
+                  className="guesser-word-correct celebration-card"
+                  dir={isAnswerArabic ? 'rtl' : 'ltr'}
+                  role="status"
+                  aria-label="Celebration: Correct word guessed!"
+                >
+                  <span className="celebration-star" aria-hidden="true">🌟</span>
                   <span className="word-label">Correct!</span>
                   <strong className="word-highlight">{answerText || 'Word Guessed!'}</strong>
+                  <span className="celebration-star" aria-hidden="true">🌟</span>
                 </div>
               ) : (
                 <div

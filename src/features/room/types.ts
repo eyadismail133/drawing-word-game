@@ -34,9 +34,10 @@ export type Stroke = {
   points?: StrokePoint[]
   color: string
   size: number
-  tool: 'pen' | 'eraser' | 'clear'
+  tool: 'pen' | 'eraser' | 'clear' | 'fill'
   authorId: string
   createdAt: number | null
+  clientOpId?: string
 }
 
 export type Room = {

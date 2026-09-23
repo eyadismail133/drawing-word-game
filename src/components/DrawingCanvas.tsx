@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
 import type { Stroke, StrokePoint } from '../features/room/types'
+import { executeFloodFillOnCanvas, normalizedToPixel } from '../features/drawing/floodFill'
 
 export type DrawingCanvasProps = {
   strokes?: Record<string, Stroke> | Stroke[]
@@ -56,6 +57,60 @@ export function denormalizePoint(
   }
 }
 
+export function matchesStroke(
+  pending: Omit<Stroke, 'id' | 'createdAt'>,
+  persisted: Stroke
+): boolean {
+  if (pending.tool !== persisted.tool) return false
+  if (pending.authorId !== persisted.authorId) return false
+  if (pending.turnId && persisted.turnId && pending.turnId !== persisted.turnId) return false
+  if (pending.color !== persisted.color) return false
+  if (pending.size !== persisted.size) return false
+  const p1 = pending.points ?? []
+  const p2 = persisted.points ?? []
+  if (p1.length !== p2.length) return false
+  for (let i = 0; i < p1.length; i++) {
+    if (Math.abs(p1[i].x - p2[i].x) > 0.0001 || Math.abs(p1[i].y - p2[i].y) > 0.0001) {
+      return false
+    }
+  }
+  return true
+}
+
+export function matchesPendingWithPersisted(
+  pending: {
+    tool: 'pen' | 'eraser' | 'clear' | 'fill'
+    color: string
+    size: number
+    authorId: string
+    turnId?: string
+    points?: StrokePoint[]
+    clientOpId?: string
+    persistedId?: string
+    persistedIdsAtCreation: Set<string>
+  },
+  persisted: Stroke
+): boolean {
+  // 1. Exact match by stable client operation ID if both have it
+  if (pending.clientOpId && persisted.clientOpId) {
+    return pending.clientOpId === persisted.clientOpId
+  }
+
+  // 2. Exact match by returned persistence ID if captured
+  if (pending.persistedId) {
+    return pending.persistedId === persisted.id
+  }
+
+  // 3. Sound ordered reconciliation:
+  // Cannot match any historical stroke that was already persisted when this pending operation was created
+  if (pending.persistedIdsAtCreation.has(persisted.id)) {
+    return false
+  }
+
+  // Match content attributes for non-historical strokes
+  return matchesStroke(pending, persisted)
+}
+
 export function DrawingCanvas({
   strokes = {},
   currentTurnId,
@@ -70,15 +125,31 @@ export function DrawingCanvas({
 
   const [color, setColor] = useState<string>('#0f172a')
   const [size, setSize] = useState<number>(7)
-  const [tool, setTool] = useState<'pen' | 'eraser'>('pen')
+  const [tool, setTool] = useState<'pen' | 'eraser' | 'fill'>('pen')
   const [isClearing, setIsClearing] = useState<boolean>(false)
   const isDrawingRef = useRef<boolean>(false)
   const currentPointsRef = useRef<StrokePoint[]>([])
   const lastBatchTimeRef = useRef<number>(0)
   const lastSentIndexRef = useRef<number>(-1)
+
+  type LocalPendingStroke = Omit<Stroke, 'id' | 'createdAt'> & {
+    localId: string
+    createdAt: number
+    clientOpId?: string
+    persistedId?: string
+    persistedIdsAtCreation: Set<string>
+  }
+  const localPendingStrokesRef = useRef<LocalPendingStroke[]>([])
+
   type QueueItem =
-    | { kind: 'stroke'; payload: Omit<Stroke, 'id' | 'createdAt'> }
-    | { kind: 'clear'; resolve: () => void; reject: (err: unknown) => void }
+    | { kind: 'stroke'; payload: Omit<Stroke, 'id' | 'createdAt'>; localId: string }
+    | {
+        kind: 'clear'
+        payload: Omit<Stroke, 'id' | 'createdAt'>
+        localId: string
+        resolve: () => void
+        reject: (err: unknown) => void
+      }
 
   const isAppendingRef = useRef<boolean>(false)
   const isInFlightRef = useRef<boolean>(false)
@@ -97,41 +168,37 @@ export function DrawingCanvas({
     return rawStrokeList.filter((s) => !s.turnId || s.turnId === currentTurnId)
   }, [rawStrokeList, currentTurnId])
 
-  // Replay all persisted strokes onto the canvas, preserving in-progress strokes
-  const renderAllStrokes = useCallback(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
+  const drawStroke = useCallback(
+    (
+      ctx: CanvasRenderingContext2D,
+      stroke: {
+        tool: 'pen' | 'eraser' | 'clear' | 'fill'
+        points?: StrokePoint[]
+        color: string
+        size: number
+      },
+      width: number,
+      height: number
+    ) => {
+      if (stroke.tool === 'clear') {
+        ctx.fillStyle = '#ffffff'
+        ctx.fillRect(0, 0, width, height)
+        return
+      }
 
-    const width = canvas.width
-    const height = canvas.height
+      if (!stroke.points || stroke.points.length === 0) return
 
-    ctx.fillStyle = '#ffffff'
-    ctx.fillRect(0, 0, width, height)
-
-    // Sort by createdAt or push id to maintain deterministic order (code-unit comparison)
-    const sorted = [...strokeList].sort(
-      (a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
-    )
-
-    // Clear marker: find last clear stroke and only render strokes after it
-    const lastClearIndex = sorted.map((s) => s.tool).lastIndexOf('clear')
-    const visibleStrokes = lastClearIndex >= 0 ? sorted.slice(lastClearIndex + 1) : sorted
-
-    for (const stroke of visibleStrokes) {
-      if (!stroke.points || stroke.points.length === 0) continue
+      if (stroke.tool === 'fill') {
+        const pixel = normalizedToPixel(stroke.points[0].x, stroke.points[0].y, width, height)
+        executeFloodFillOnCanvas(ctx, pixel.x, pixel.y, stroke.color)
+        return
+      }
 
       ctx.beginPath()
       ctx.lineCap = 'round'
       ctx.lineJoin = 'round'
       ctx.lineWidth = Math.max(1, stroke.size * (width / 600))
-
-      if (stroke.tool === 'eraser') {
-        ctx.strokeStyle = '#ffffff'
-      } else {
-        ctx.strokeStyle = stroke.color
-      }
+      ctx.strokeStyle = stroke.tool === 'eraser' ? '#ffffff' : stroke.color
 
       if (stroke.points.length === 1) {
         const pt = denormalizePoint(stroke.points[0], width, height)
@@ -147,33 +214,86 @@ export function DrawingCanvas({
         }
         ctx.stroke()
       }
+    },
+    []
+  )
+
+  // Replay all persisted strokes onto the canvas, preserving in-progress and unpersisted local strokes
+  const renderAllStrokes = useCallback(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    const width = canvas.width
+    const height = canvas.height
+
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, width, height)
+
+    // Sort persisted strokes by timestamp and stable code-unit ID order
+    const sorted = [...strokeList].sort(
+      (a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+    )
+
+    // Reconcile and prune local pending strokes that are now in sorted persisted strokes
+    const matchedPersistedIds = new Set<string>()
+    localPendingStrokesRef.current = localPendingStrokesRef.current.filter((pending) => {
+      if (currentTurnId && pending.turnId && pending.turnId !== currentTurnId) {
+        return false
+      }
+      const match = sorted.find(
+        (s) => !matchedPersistedIds.has(s.id) && matchesPendingWithPersisted(pending, s)
+      )
+      if (match) {
+        matchedPersistedIds.add(match.id)
+        return false
+      }
+      return true
+    })
+
+    // Check for clear markers in local pending strokes vs persisted strokes
+    const lastPendingClearIndex = localPendingStrokesRef.current
+      .map((s) => s.tool)
+      .lastIndexOf('clear')
+
+    if (lastPendingClearIndex >= 0) {
+      // An unpersisted local clear is active: all persisted strokes precede it and must not be rendered!
+      // Only render pending strokes enqueued AFTER the last pending clear:
+      const visiblePending = localPendingStrokesRef.current.slice(lastPendingClearIndex + 1)
+      for (const pending of visiblePending) {
+        drawStroke(ctx, pending, width, height)
+      }
+    } else {
+      // Clear marker in persisted strokes
+      const lastClearIndex = sorted.map((s) => s.tool).lastIndexOf('clear')
+      const visibleStrokes = lastClearIndex >= 0 ? sorted.slice(lastClearIndex + 1) : sorted
+
+      for (const stroke of visibleStrokes) {
+        drawStroke(ctx, stroke, width, height)
+      }
+
+      // Preserve local unpersisted strokes so tool switches or delayed appends do not wipe the scene
+      for (const pending of localPendingStrokesRef.current) {
+        drawStroke(ctx, pending, width, height)
+      }
     }
 
     // Preserve and redraw active in-progress gesture if drawing
     if (isDrawingRef.current && currentPointsRef.current.length > 0) {
-      const pts = currentPointsRef.current
-      ctx.beginPath()
-      ctx.lineCap = 'round'
-      ctx.lineJoin = 'round'
-      ctx.lineWidth = Math.max(1, size * (width / 600))
-      ctx.strokeStyle = tool === 'eraser' ? '#ffffff' : color
-
-      if (pts.length === 1) {
-        const pt = denormalizePoint(pts[0], width, height)
-        ctx.arc(pt.x, pt.y, ctx.lineWidth / 2, 0, Math.PI * 2)
-        ctx.fillStyle = tool === 'eraser' ? '#ffffff' : color
-        ctx.fill()
-      } else {
-        const first = denormalizePoint(pts[0], width, height)
-        ctx.moveTo(first.x, first.y)
-        for (let i = 1; i < pts.length; i++) {
-          const pt = denormalizePoint(pts[i], width, height)
-          ctx.lineTo(pt.x, pt.y)
-        }
-        ctx.stroke()
-      }
+      drawStroke(
+        ctx,
+        {
+          tool: tool === 'fill' ? 'pen' : tool,
+          points: currentPointsRef.current,
+          color,
+          size,
+        },
+        width,
+        height
+      )
     }
-  }, [strokeList, size, color, tool])
+  }, [strokeList, currentTurnId, tool, color, size, drawStroke])
 
   // Resize canvas according to container dimensions
   useEffect(() => {
@@ -264,12 +384,28 @@ export function DrawingCanvas({
           const res = onAppendStroke(nextItem.payload)
           promise = res instanceof Promise ? res : Promise.resolve(res)
         } catch {
+          localPendingStrokesRef.current = localPendingStrokesRef.current.filter(
+            (s) => s.localId !== nextItem.localId
+          )
           renderAllStrokes()
           promise = Promise.resolve()
         }
 
         promise
+          .then((persistedResult) => {
+            if (typeof persistedResult === 'string' && persistedResult) {
+              const pending = localPendingStrokesRef.current.find(
+                (s) => s.localId === nextItem.localId
+              )
+              if (pending) {
+                pending.persistedId = persistedResult
+              }
+            }
+          })
           .catch(() => {
+            localPendingStrokesRef.current = localPendingStrokesRef.current.filter(
+              (s) => s.localId !== nextItem.localId
+            )
             renderAllStrokes()
           })
           .finally(() => {
@@ -284,14 +420,7 @@ export function DrawingCanvas({
             const res = onClearCanvas()
             clearPromise = res instanceof Promise ? res : Promise.resolve(res)
           } else if (onAppendStroke) {
-            const res = onAppendStroke({
-              authorId: currentUserId,
-              turnId: currentTurnId,
-              tool: 'clear',
-              points: [],
-              color: '#ffffff',
-              size: 0,
-            })
+            const res = onAppendStroke(nextItem.payload)
             clearPromise = res instanceof Promise ? res : Promise.resolve(res)
           } else {
             clearPromise = Promise.resolve()
@@ -301,10 +430,21 @@ export function DrawingCanvas({
         }
 
         clearPromise
-          .then(() => {
+          .then((persistedResult) => {
+            if (typeof persistedResult === 'string' && persistedResult) {
+              const pending = localPendingStrokesRef.current.find(
+                (s) => s.localId === nextItem.localId
+              )
+              if (pending) {
+                pending.persistedId = persistedResult
+              }
+            }
             nextItem.resolve()
           })
           .catch((err) => {
+            localPendingStrokesRef.current = localPendingStrokesRef.current.filter(
+              (s) => s.localId !== nextItem.localId
+            )
             renderAllStrokes()
             nextItem.reject(err)
           })
@@ -342,18 +482,40 @@ export function DrawingCanvas({
 
   const enqueueAppend = useCallback(
     (strokePayload: Omit<Stroke, 'id' | 'createdAt'>) => {
-      pendingQueueRef.current.push({ kind: 'stroke', payload: strokePayload })
+      const localId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+      const clientOpId =
+        strokePayload.clientOpId ??
+        `op-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+      const fullPayload = { ...strokePayload, clientOpId }
+      const persistedIdsAtCreation = new Set(strokeList.map((s) => s.id))
+      localPendingStrokesRef.current.push({
+        ...fullPayload,
+        localId,
+        createdAt: Date.now(),
+        clientOpId,
+        persistedIdsAtCreation,
+      })
+      pendingQueueRef.current.push({ kind: 'stroke', payload: fullPayload, localId })
       processAppendQueue()
+    },
+    [strokeList, processAppendQueue]
+  )
+
+  const enqueueClear = useCallback(
+    (clearPayload: Omit<Stroke, 'id' | 'createdAt'>, localId: string): Promise<void> => {
+      return new Promise((resolve, reject) => {
+        pendingQueueRef.current.push({
+          kind: 'clear',
+          payload: clearPayload,
+          localId,
+          resolve,
+          reject,
+        })
+        processAppendQueue()
+      })
     },
     [processAppendQueue]
   )
-
-  const enqueueClear = useCallback((): Promise<void> => {
-    return new Promise((resolve, reject) => {
-      pendingQueueRef.current.push({ kind: 'clear', resolve, reject })
-      processAppendQueue()
-    })
-  }, [processAppendQueue])
 
   const waitForAppendQueue = useCallback((): Promise<void> => {
     if (!isAppendingRef.current && pendingQueueRef.current.length === 0) {
@@ -397,6 +559,33 @@ export function DrawingCanvas({
     if (!isDrawer || disabled || !onAppendStroke) return
     const canvas = canvasRef.current
     if (!canvas) return
+
+    if (tool === 'fill') {
+      flushBatch()
+      renderAllStrokes()
+      const point = getCanvasPoint(e)
+      const pixel = normalizedToPixel(point.x, point.y, canvas.width, canvas.height)
+      const ctx = canvas.getContext('2d')
+      if (ctx) {
+        const changed = executeFloodFillOnCanvas(
+          ctx,
+          pixel.x,
+          pixel.y,
+          color
+        )
+        if (changed) {
+          enqueueAppend({
+            turnId: currentTurnId,
+            points: [point],
+            color,
+            size: 0,
+            tool: 'fill',
+            authorId: currentUserId,
+          })
+        }
+      }
+      return
+    }
 
     canvas.setPointerCapture(e.pointerId)
     isDrawingRef.current = true
@@ -478,6 +667,9 @@ export function DrawingCanvas({
     currentPointsRef.current = []
     lastSentIndexRef.current = -1
 
+    // Collect localIds of discarded queued strokes so optimistic state is cleaned up
+    const discardedLocalIds = new Set<string>()
+
     // Settle any queued clear operations so isClearing cannot remain stuck
     const clearItems: Array<Extract<QueueItem, { kind: 'clear' }>> = []
     pendingQueueRef.current = pendingQueueRef.current.filter((item) => {
@@ -485,11 +677,18 @@ export function DrawingCanvas({
         clearItems.push(item)
         return false
       }
+      discardedLocalIds.add(item.localId)
       return false // Discard not-yet-dispatched stroke work from the cancelled gesture
     })
     clearItems.forEach((item) => {
       item.reject(new Error('Clear cancelled by pointer cancel'))
     })
+
+    // Remove discarded optimistic operations from localPendingStrokesRef,
+    // while preserving any in-flight operation currently being processed
+    localPendingStrokesRef.current = localPendingStrokesRef.current.filter(
+      (s) => !discardedLocalIds.has(s.localId)
+    )
 
     // If no request is in flight, clear timer and mark pipeline idle.
     // If a request is in flight, preserve strict queue ownership (isAppendingRef remains true)
@@ -516,6 +715,26 @@ export function DrawingCanvas({
     currentPointsRef.current = []
     lastSentIndexRef.current = -1
 
+    const clearLocalId = `clear-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+    const clearPayload: Omit<Stroke, 'id' | 'createdAt'> = {
+      authorId: currentUserId,
+      turnId: currentTurnId,
+      tool: 'clear',
+      points: [],
+      color: '#ffffff',
+      size: 0,
+      clientOpId: clearLocalId,
+    }
+
+    // Add optimistic clear marker to localPendingStrokesRef
+    localPendingStrokesRef.current.push({
+      ...clearPayload,
+      localId: clearLocalId,
+      createdAt: Date.now(),
+      clientOpId: clearLocalId,
+      persistedIdsAtCreation: new Set(strokeList.map((s) => s.id)),
+    })
+
     const canvas = canvasRef.current
     if (canvas) {
       const ctx = canvas.getContext('2d')
@@ -526,8 +745,11 @@ export function DrawingCanvas({
     }
 
     try {
-      await enqueueClear()
+      await enqueueClear(clearPayload, clearLocalId)
     } catch {
+      localPendingStrokesRef.current = localPendingStrokesRef.current.filter(
+        (s) => s.localId !== clearLocalId
+      )
       renderAllStrokes()
     } finally {
       setIsClearing(false)
@@ -565,6 +787,15 @@ export function DrawingCanvas({
               aria-pressed={tool === 'pen'}
             >
               ✏️ Pen
+            </button>
+            <button
+              type="button"
+              className={`btn-tool ${tool === 'fill' ? 'active' : ''}`}
+              onClick={() => setTool('fill')}
+              aria-label="Fill tool"
+              aria-pressed={tool === 'fill'}
+            >
+              🪣 Fill
             </button>
             <button
               type="button"
@@ -610,20 +841,23 @@ export function DrawingCanvas({
           </div>
 
           <div className="toolbar-section toolbar-palette" role="group" aria-label="Color palette">
-            {PALETTE_COLORS.map((c) => (
-              <button
-                key={c.hex}
-                type="button"
-                className={`btn-color ${color === c.hex && tool === 'pen' ? 'active' : ''}`}
-                style={{ backgroundColor: c.hex }}
-                onClick={() => {
-                  setColor(c.hex)
-                  if (tool === 'eraser') setTool('pen')
-                }}
-                aria-label={`${c.name} color`}
-                aria-pressed={color === c.hex && tool === 'pen'}
-              />
-            ))}
+            {PALETTE_COLORS.map((c) => {
+              const isColorActive = color === c.hex && (tool === 'pen' || tool === 'fill')
+              return (
+                <button
+                  key={c.hex}
+                  type="button"
+                  className={`btn-color ${isColorActive ? 'active' : ''}`}
+                  style={{ backgroundColor: c.hex }}
+                  onClick={() => {
+                    setColor(c.hex)
+                    if (tool === 'eraser') setTool('pen')
+                  }}
+                  aria-label={`${c.name} color`}
+                  aria-pressed={isColorActive}
+                />
+              )
+            })}
           </div>
         </div>
       )}

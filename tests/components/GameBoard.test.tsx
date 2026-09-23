@@ -434,6 +434,7 @@ describe('GameBoard component', () => {
       expect(drawerCanvas).toBeInTheDocument()
       expect(screen.getByRole('toolbar', { name: /drawing tools/i })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: /pen tool/i })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /fill tool/i })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: /eraser tool/i })).toBeInTheDocument()
       unmount()
 

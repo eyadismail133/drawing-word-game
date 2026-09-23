@@ -167,8 +167,17 @@ export function GuessChat({
       </div>
 
       {hasGuessedCorrectly && (
-        <div className="alert-banner alert-banner-success mb-2" role="status">
-          <span>🎉 You guessed the word!</span>
+        <div
+          className="correct-guess-celebration alert-banner alert-banner-success mb-2"
+          role="status"
+          aria-label="Celebration: You guessed the word!"
+        >
+          <div className="celebration-particles" aria-hidden="true">
+            <span className="celebration-sparkle sparkle-1">✨</span>
+            <span className="celebration-sparkle sparkle-2">🎉</span>
+            <span className="celebration-sparkle sparkle-3">⭐</span>
+          </div>
+          <span className="celebration-message">🎉 You guessed the word!</span>
         </div>
       )}
 

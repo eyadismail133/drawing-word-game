@@ -1334,4 +1334,69 @@ describe('Realtime Database room rules', () => {
       createdAt: 1600,
     }))
   })
+
+  it('proves only the active drawer can persist a fill event for the current turn', async () => {
+    await repositoryFor('host').createRoom(room())
+    await repositoryFor('guest').joinRoom(roomId, player('guest'))
+    await repositoryFor('host').startGame(roomId, 'host', [word])
+
+    const activeRoom = (await repositoryFor('host').getRoom(roomId))!
+    const drawerId = activeRoom.game.drawerId!
+    const guesserId = drawerId === 'host' ? 'guest' : 'host'
+    const turnId = activeRoom.game.turnId!
+
+    await repositoryFor(drawerId).chooseWord(roomId, drawerId, word)
+
+    // Guesser cannot persist a fill event
+    await assertFails(
+      repositoryFor(guesserId).appendStroke(roomId, {
+        authorId: guesserId,
+        turnId,
+        tool: 'fill',
+        points: [{ x: 0.5, y: 0.5 }],
+        color: '#3b82f6',
+        size: 0,
+      })
+    )
+
+    // Drawer cannot persist a fill event for a mismatched turn
+    await assertFails(
+      repositoryFor(drawerId).appendStroke(roomId, {
+        authorId: drawerId,
+        turnId: 'wrong-turn',
+        tool: 'fill',
+        points: [{ x: 0.5, y: 0.5 }],
+        color: '#3b82f6',
+        size: 0,
+      })
+    )
+
+    // Drawer cannot persist a fill event impersonating another author
+    await assertFails(
+      repositoryFor(drawerId).appendStroke(roomId, {
+        authorId: guesserId,
+        turnId,
+        tool: 'fill',
+        points: [{ x: 0.5, y: 0.5 }],
+        color: '#3b82f6',
+        size: 0,
+      })
+    )
+
+    // Active drawer can persist a fill event for the current turn
+    const fillStrokeId = await repositoryFor(drawerId).appendStroke(roomId, {
+      authorId: drawerId,
+      turnId,
+      tool: 'fill',
+      points: [{ x: 0.5, y: 0.5 }],
+      color: '#3b82f6',
+      size: 0,
+    })
+    expect(fillStrokeId).toBeTruthy()
+
+    const roomAfterFill = await repositoryFor('host').getRoom(roomId)
+    expect(roomAfterFill?.strokes?.[fillStrokeId]?.tool).toBe('fill')
+    expect(roomAfterFill?.strokes?.[fillStrokeId]?.color).toBe('#3b82f6')
+    expect(roomAfterFill?.strokes?.[fillStrokeId]?.points).toEqual([{ x: 0.5, y: 0.5 }])
+  })
 })

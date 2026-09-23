@@ -865,6 +865,76 @@ body {
   color: var(--color-mint);
 }
 
+.guesser-word-correct.celebration-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.75rem;
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.4);
+  border-radius: var(--border-radius-sm);
+  animation: celebration-bounce 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+
+.celebration-star {
+  font-size: 1.1rem;
+  display: inline-block;
+  animation: celebration-sparkle 0.6s ease-in-out 3 alternate forwards;
+}
+
+.correct-guess-celebration {
+  position: relative;
+  overflow: hidden;
+  animation: celebration-pop 0.35s ease-out forwards;
+}
+
+.celebration-particles {
+  display: inline-flex;
+  gap: 0.35rem;
+  margin-right: 0.5rem;
+}
+
+.celebration-sparkle {
+  display: inline-block;
+  font-size: 0.95rem;
+  animation: celebration-sparkle 0.5s ease-in-out 3 alternate forwards;
+}
+
+.celebration-sparkle.sparkle-2 {
+  animation-delay: 0.15s;
+}
+
+.celebration-sparkle.sparkle-3 {
+  animation-delay: 0.3s;
+}
+
+@keyframes celebration-bounce {
+  0% { transform: scale(0.9); opacity: 0.8; }
+  60% { transform: scale(1.05); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+@keyframes celebration-pop {
+  0% { transform: translateY(-4px); opacity: 0; }
+  100% { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes celebration-sparkle {
+  0% { transform: translateY(0) scale(0.95); opacity: 0.8; }
+  100% { transform: translateY(-2px) scale(1.1); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .guesser-word-correct.celebration-card,
+  .celebration-star,
+  .correct-guess-celebration,
+  .celebration-sparkle {
+    animation: none !important;
+    transition: none !important;
+    transform: none !important;
+  }
+}
+
 .game-header-actions {
   display: flex;
   align-items: center;

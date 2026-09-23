@@ -1,6 +1,11 @@
 import '@testing-library/jest-dom/vitest'
 import { vi } from 'vitest'
 
+if (typeof window !== 'undefined' && typeof window.PointerEvent === 'undefined') {
+  // @ts-expect-error polyfill PointerEvent with MouseEvent in jsdom environment
+  window.PointerEvent = window.MouseEvent
+}
+
 if (typeof HTMLCanvasElement !== 'undefined') {
   HTMLCanvasElement.prototype.getContext = vi.fn().mockImplementation(() => ({
     fillRect: vi.fn(),
