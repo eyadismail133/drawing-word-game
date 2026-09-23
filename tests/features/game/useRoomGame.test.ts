@@ -37,6 +37,18 @@ vi.mock('firebase/database', async () => {
   }
 })
 
+let wrongGuessesCallbacks: Record<string, (guesses: any[]) => void> = {}
+let playerGuessCallbacks: Record<string, (text: string | null) => void> = {}
+const mockSubscribeToWrongGuesses = vi.fn((_roomId: string, turnId: string, onGuesses: (guesses: any[]) => void) => {
+  wrongGuessesCallbacks[turnId] = onGuesses
+  return vi.fn()
+})
+const mockAdjudicateGuess = vi.fn().mockResolvedValue(false)
+const mockSubscribeToPlayerGuess = vi.fn((_roomId: string, turnId: string, playerId: string, onGuess: (text: string | null) => void) => {
+  playerGuessCallbacks[`${turnId}_${playerId}`] = onGuess
+  return vi.fn()
+})
+
 vi.mock('../../../src/features/room/repository', () => ({
   createRoomRepository: () => ({
     getRoom: mockGetRoom,
@@ -48,6 +60,11 @@ vi.mock('../../../src/features/room/repository', () => ({
       roomErrorCallback = onError
       return vi.fn()
     }),
+    subscribeToWrongGuesses: (_roomId: string, turnId: string, onGuesses: (guesses: any[]) => void) =>
+      mockSubscribeToWrongGuesses(_roomId, turnId, onGuesses),
+    adjudicateGuess: (...args: any[]) => mockAdjudicateGuess(...args),
+    subscribeToPlayerGuess: (_roomId: string, turnId: string, playerId: string, onGuess: (text: string | null) => void) =>
+      mockSubscribeToPlayerGuess(_roomId, turnId, playerId, onGuess),
   }),
 }))
 
@@ -92,6 +109,7 @@ describe('useRoomGame presence and lifecycle', () => {
     connectedErrorCallback = null
     roomSnapshotCallback = null
     roomErrorCallback = null
+    wrongGuessesCallbacks = {}
     mockSetPlayerPresence.mockResolvedValue(undefined)
     isOnline = true
   })
@@ -1000,5 +1018,565 @@ describe('useRoomGame presence and lifecycle', () => {
     })
     expect(result.current.room?.id).toBe('ROOMA1')
     expect(result.current.error).toBeNull()
+  })
+
+  it('scopes wrongGuesses by roomId and turnId and does not expose old-turn data when moving directly between drawing turns until new subscription emits', async () => {
+    const drawingRoomTurn0: Room = {
+      ...baseRoom,
+      status: 'drawing',
+      game: {
+        ...baseRoom.game,
+        turnId: 'turn-0',
+        turnIndex: 0,
+        drawerId: 'host-1',
+      },
+      players: {
+        'host-1': { id: 'host-1', name: 'Alice', score: 0, connected: true },
+        'user-1': { id: 'user-1', name: 'Bob', score: 0, connected: true },
+      },
+      slots: { '0': 'host-1', '1': 'user-1' },
+    }
+
+    mockGetRoom.mockResolvedValue({ ...drawingRoomTurn0 })
+
+    const { result } = renderHook(() => useRoomGame('AB12CD', 'user-1'))
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false)
+    })
+
+    // Emit initial room snapshot for turn-0
+    act(() => {
+      roomSnapshotCallback!({ ...drawingRoomTurn0 })
+    })
+
+    await waitFor(() => {
+      expect(wrongGuessesCallbacks['turn-0']).toBeDefined()
+    })
+
+    // Emit wrong guesses for turn-0
+    act(() => {
+      wrongGuessesCallbacks['turn-0']([
+        { id: 'user-1_att1', playerId: 'user-1', playerName: 'Bob', text: 'elephant', createdAt: 1000 },
+      ])
+    })
+
+    expect(result.current.wrongGuesses).toHaveLength(1)
+    expect(result.current.wrongGuesses[0].text).toBe('elephant')
+
+    // Room moves directly to turn-1 while remaining in drawing status
+    const drawingRoomTurn1: Room = {
+      ...drawingRoomTurn0,
+      game: {
+        ...drawingRoomTurn0.game,
+        turnId: 'turn-1',
+        turnIndex: 1,
+        drawerId: 'user-1',
+      },
+    }
+
+    act(() => {
+      roomSnapshotCallback!({ ...drawingRoomTurn1 })
+    })
+
+    // BEFORE turn-1 subscription emits (delayed new snapshot):
+    // wrongGuesses MUST NOT expose old turn-0 data!
+    expect(result.current.wrongGuesses).toEqual([])
+
+    await waitFor(() => {
+      expect(wrongGuessesCallbacks['turn-1']).toBeDefined()
+    })
+
+    // Now turn-1 subscription snapshot emits
+    act(() => {
+      wrongGuessesCallbacks['turn-1']([
+        { id: 'host-1_att1', playerId: 'host-1', playerName: 'Alice', text: 'giraffe', createdAt: 2000 },
+      ])
+    })
+
+    // Exposes matching turn-1 data
+    expect(result.current.wrongGuesses).toHaveLength(1)
+    expect(result.current.wrongGuesses[0].text).toBe('giraffe')
+  })
+
+  it('keeps wrong-feed subscribed and displays guesses during results status for the same turn', async () => {
+    isOnline = true
+    wrongGuessesCallbacks = {}
+    const roomWithMember: Room = {
+      ...baseRoom,
+      status: 'drawing',
+      game: {
+        ...baseRoom.game,
+        turnId: 'turn-0',
+        drawerId: 'host-1',
+      },
+      players: {
+        'host-1': { id: 'host-1', name: 'Host', connected: true },
+        'user-1': { id: 'user-1', name: 'User 1', connected: true },
+      },
+    }
+    mockGetRoom.mockResolvedValueOnce({ ...roomWithMember })
+
+    const { result } = renderHook(() => useRoomGame('AB12CD', 'user-1'))
+    await waitFor(() => expect(result.current.loading).toBe(false))
+
+    // Emit drawing status
+    act(() => {
+      roomSnapshotCallback!({ ...roomWithMember })
+    })
+
+    await waitFor(() => {
+      expect(wrongGuessesCallbacks['turn-0']).toBeDefined()
+    })
+
+    act(() => {
+      wrongGuessesCallbacks['turn-0']([
+        { id: 'user-1_att1', playerId: 'user-1', playerName: 'Bob', text: 'elephant', createdAt: 1000 },
+      ])
+    })
+
+    expect(result.current.wrongGuesses).toHaveLength(1)
+    expect(result.current.wrongGuesses[0].text).toBe('elephant')
+
+    // Room transitions to results status for the same turn
+    act(() => {
+      roomSnapshotCallback!({
+        ...roomWithMember,
+        status: 'results',
+      })
+    })
+
+    // Wrong guesses remain visible during results!
+    expect(result.current.wrongGuesses).toHaveLength(1)
+    expect(result.current.wrongGuesses[0].text).toBe('elephant')
+
+    // Late wrong guess arriving during results is displayed!
+    act(() => {
+      wrongGuessesCallbacks['turn-0']([
+        { id: 'user-1_att1', playerId: 'user-1', playerName: 'Bob', text: 'elephant', createdAt: 1000 },
+        { id: 'user-2_att1', playerId: 'user-2', playerName: 'Charlie', text: 'banana', createdAt: 1500 },
+      ])
+    })
+
+    expect(result.current.wrongGuesses).toHaveLength(2)
+    expect(result.current.wrongGuesses[1].text).toBe('banana')
+
+    // When moving to choosing/lobby or new turn, wrong guesses are cleared
+    act(() => {
+      roomSnapshotCallback!({
+        ...roomWithMember,
+        status: 'choosing',
+        game: {
+          ...roomWithMember.game,
+          turnId: 'turn-1',
+          drawerId: 'user-1',
+        },
+      })
+    })
+
+    expect(result.current.wrongGuesses).toEqual([])
+  })
+
+  it('surfaces wrong-publication failure as nonfatal warning and clears it on new turn', async () => {
+    isOnline = true
+    playerGuessCallbacks = {}
+    mockAdjudicateGuess.mockRejectedValue(new Error('TRANSIENT_PUB_FAIL'))
+
+    mockGetRoom.mockResolvedValueOnce({
+      ...baseRoom,
+      status: 'drawing',
+      game: {
+        ...baseRoom.game,
+        turnId: 'turn-0',
+        drawerId: 'user-1',
+      },
+      players: {
+        'user-1': { id: 'user-1', name: 'Drawer', score: 0, connected: true },
+        'guest-1': { id: 'guest-1', name: 'Guesser', score: 0, connected: true },
+      },
+    })
+
+    const { result } = renderHook(() => useRoomGame('AB12CD', 'user-1'))
+    await waitFor(() => expect(result.current.loading).toBe(false))
+
+    act(() => {
+      roomSnapshotCallback!({
+        ...baseRoom,
+        status: 'drawing',
+        game: {
+          ...baseRoom.game,
+          turnId: 'turn-0',
+          drawerId: 'user-1',
+        },
+        players: {
+          'user-1': { id: 'user-1', name: 'Drawer', score: 0, connected: true },
+          'guest-1': { id: 'guest-1', name: 'Guesser', score: 0, connected: true },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(playerGuessCallbacks['turn-0_guest-1']).toBeDefined()
+    })
+
+    // Guesser submits a guess -> triggers adjudication
+    act(() => {
+      playerGuessCallbacks['turn-0_guest-1']('zebra')
+    })
+
+    // Wait for bounded retries to exhaust and warning to be set
+    await waitFor(
+      () => {
+        expect(result.current.warning).toContain('TRANSIENT_PUB_FAIL')
+      },
+      { timeout: 3500 }
+    )
+
+    // Fatal room error is NOT set (preserves GameBoard view!)
+    expect(result.current.error).toBeNull()
+
+    // Room transitions to a new turn -> warning is automatically cleared!
+    act(() => {
+      roomSnapshotCallback!({
+        ...baseRoom,
+        status: 'drawing',
+        game: {
+          ...baseRoom.game,
+          turnId: 'turn-1',
+          drawerId: 'guest-1',
+        },
+        players: {
+          'user-1': { id: 'user-1', name: 'Drawer', score: 0, connected: true },
+          'guest-1': { id: 'guest-1', name: 'Guesser', score: 0, connected: true },
+        },
+      })
+    })
+
+    expect(result.current.warning).toBeNull()
+  })
+
+  it('tracks failures per room/turn/player so Player B success does not clear Player A warning', async () => {
+    isOnline = true
+    playerGuessCallbacks = {}
+    mockAdjudicateGuess.mockImplementation(async (_roomId: string, guesserId: string) => {
+      if (guesserId === 'guest-1') {
+        throw new Error('FAIL_A')
+      }
+      return true
+    })
+
+    mockGetRoom.mockResolvedValueOnce({
+      ...baseRoom,
+      status: 'drawing',
+      game: {
+        ...baseRoom.game,
+        turnId: 'turn-0',
+        drawerId: 'user-1',
+      },
+      players: {
+        'user-1': { id: 'user-1', name: 'Drawer', score: 0, connected: true },
+        'guest-1': { id: 'guest-1', name: 'Alice', score: 0, connected: true },
+        'guest-2': { id: 'guest-2', name: 'Bob', score: 0, connected: true },
+      },
+    })
+
+    const { result } = renderHook(() => useRoomGame('AB12CD', 'user-1'))
+    await waitFor(() => expect(result.current.loading).toBe(false))
+
+    act(() => {
+      roomSnapshotCallback!({
+        ...baseRoom,
+        status: 'drawing',
+        game: {
+          ...baseRoom.game,
+          turnId: 'turn-0',
+          drawerId: 'user-1',
+        },
+        players: {
+          'user-1': { id: 'user-1', name: 'Drawer', score: 0, connected: true },
+          'guest-1': { id: 'guest-1', name: 'Alice', score: 0, connected: true },
+          'guest-2': { id: 'guest-2', name: 'Bob', score: 0, connected: true },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(playerGuessCallbacks['turn-0_guest-1']).toBeDefined()
+      expect(playerGuessCallbacks['turn-0_guest-2']).toBeDefined()
+    })
+
+    // Player A submits guess -> fails and exhausts retries
+    act(() => {
+      playerGuessCallbacks['turn-0_guest-1']('guess_a')
+    })
+
+    await waitFor(
+      () => {
+        expect(result.current.warning).toContain('Alice')
+        expect(result.current.warning).toContain('FAIL_A')
+      },
+      { timeout: 3500 }
+    )
+
+    // Player B submits guess -> succeeds
+    act(() => {
+      playerGuessCallbacks['turn-0_guest-2']('guess_b')
+    })
+
+    // Wait a moment: Player B's success must NOT clear Player A's warning!
+    await new Promise((r) => setTimeout(r, 200))
+    expect(result.current.warning).toContain('Alice')
+    expect(result.current.warning).toContain('FAIL_A')
+
+    // Now Player A recovers (e.g. adjudicate now succeeds for Alice)
+    mockAdjudicateGuess.mockResolvedValue(true)
+    await act(async () => {
+      await result.current.retryPendingGuesses?.()
+    })
+
+    // Once Player A recovers, warning is cleared!
+    expect(result.current.warning).toBeNull()
+  })
+
+  it('distinguishes score failures from publication failures in warning text', async () => {
+    isOnline = true
+    playerGuessCallbacks = {}
+    mockAdjudicateGuess.mockRejectedValue(new Error('Permission denied on game/awards: score failure'))
+
+    mockGetRoom.mockResolvedValueOnce({
+      ...baseRoom,
+      status: 'drawing',
+      game: {
+        ...baseRoom.game,
+        turnId: 'turn-0',
+        drawerId: 'user-1',
+      },
+      players: {
+        'user-1': { id: 'user-1', name: 'Drawer', score: 0, connected: true },
+        'guest-1': { id: 'guest-1', name: 'Alice', score: 0, connected: true },
+      },
+    })
+
+    const { result } = renderHook(() => useRoomGame('AB12CD', 'user-1'))
+    await waitFor(() => expect(result.current.loading).toBe(false))
+
+    act(() => {
+      roomSnapshotCallback!({
+        ...baseRoom,
+        status: 'drawing',
+        game: {
+          ...baseRoom.game,
+          turnId: 'turn-0',
+          drawerId: 'user-1',
+        },
+        players: {
+          'user-1': { id: 'user-1', name: 'Drawer', score: 0, connected: true },
+          'guest-1': { id: 'guest-1', name: 'Alice', score: 0, connected: true },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(playerGuessCallbacks['turn-0_guest-1']).toBeDefined()
+    })
+
+    act(() => {
+      playerGuessCallbacks['turn-0_guest-1']('word')
+    })
+
+    await waitFor(
+      () => {
+        expect(result.current.warning).toContain('Failed to score guess for Alice')
+      },
+      { timeout: 3500 }
+    )
+  })
+
+  it('triggers retry of pending guess failures when room transitions to results', async () => {
+    isOnline = true
+    playerGuessCallbacks = {}
+    let callCount = 0
+    mockAdjudicateGuess.mockImplementation(async () => {
+      callCount++
+      if (callCount <= 4) {
+        throw new Error('NETWORK_TIMEOUT')
+      }
+      return true
+    })
+
+    const roomSnapshot = {
+      ...baseRoom,
+      status: 'drawing' as const,
+      game: {
+        ...baseRoom.game,
+        turnId: 'turn-0',
+        drawerId: 'user-1',
+      },
+      players: {
+        'user-1': { id: 'user-1', name: 'Drawer', score: 0, connected: true },
+        'guest-1': { id: 'guest-1', name: 'Alice', score: 0, connected: true },
+      },
+    }
+
+    mockGetRoom.mockResolvedValueOnce(roomSnapshot)
+
+    const { result } = renderHook(() => useRoomGame('AB12CD', 'user-1'))
+    await waitFor(() => expect(result.current.loading).toBe(false))
+
+    act(() => {
+      roomSnapshotCallback!(roomSnapshot)
+    })
+
+    await waitFor(() => {
+      expect(playerGuessCallbacks['turn-0_guest-1']).toBeDefined()
+    })
+
+    act(() => {
+      playerGuessCallbacks['turn-0_guest-1']('guess')
+    })
+
+    await waitFor(
+      () => {
+        expect(result.current.warning).toContain('Failed to publish wrong guess from Alice')
+      },
+      { timeout: 3500 }
+    )
+
+    // Room transitions to 'results' -> triggers retryPendingGuesses automatically
+    act(() => {
+      roomSnapshotCallback!({
+        ...roomSnapshot,
+        status: 'results',
+      })
+    })
+
+    // Recovery succeeds and warning is cleared
+    await waitFor(() => {
+      expect(result.current.warning).toBeNull()
+    })
+  })
+
+  it('retries pending failures on reconnect across lobby -> drawing lifecycle using latest callback ref', async () => {
+    isOnline = true
+    playerGuessCallbacks = {}
+    let callCount = 0
+    mockAdjudicateGuess.mockImplementation(async () => {
+      callCount++
+      if (callCount <= 4) {
+        throw new Error('OFFLINE_FAILURE')
+      }
+      return true
+    })
+
+    // Mount in lobby
+    const lobbyRoom = {
+      ...baseRoom,
+      status: 'lobby' as const,
+      players: {
+        'user-1': { id: 'user-1', name: 'Drawer', score: 0, connected: true },
+        'guest-1': { id: 'guest-1', name: 'Alice', score: 0, connected: true },
+      },
+    }
+
+    mockGetRoom.mockResolvedValueOnce(lobbyRoom)
+    const { result } = renderHook(() => useRoomGame('AB12CD', 'user-1'))
+    await waitFor(() => expect(result.current.loading).toBe(false))
+
+    // Transition from lobby to drawing
+    const drawingRoom = {
+      ...baseRoom,
+      status: 'drawing' as const,
+      game: {
+        ...baseRoom.game,
+        turnId: 'turn-0',
+        drawerId: 'user-1',
+      },
+      players: {
+        'user-1': { id: 'user-1', name: 'Drawer', score: 0, connected: true },
+        'guest-1': { id: 'guest-1', name: 'Alice', score: 0, connected: true },
+      },
+    }
+
+    act(() => {
+      roomSnapshotCallback!(drawingRoom)
+    })
+
+    await waitFor(() => {
+      expect(playerGuessCallbacks['turn-0_guest-1']).toBeDefined()
+    })
+
+    // Guess submitted, fails until retries exhausted
+    act(() => {
+      playerGuessCallbacks['turn-0_guest-1']('guess')
+    })
+
+    await waitFor(
+      () => {
+        expect(result.current.warning).toContain('Alice')
+        expect(result.current.warning).toContain('OFFLINE_FAILURE')
+      },
+      { timeout: 3500 }
+    )
+
+    // Reconnect occurs (connection drops and recovers)
+    act(() => {
+      connectedCallback!({ val: () => false })
+    })
+    act(() => {
+      connectedCallback!({ val: () => true })
+    })
+
+    // Latest retry callback runs and clears the warning
+    await waitFor(() => {
+      expect(result.current.warning).toBeNull()
+    })
+  })
+
+  it('labels standard SDK PERMISSION_DENIED error accurately when operation context is attached', async () => {
+    isOnline = true
+    playerGuessCallbacks = {}
+
+    // SDK error has NO 'score' or 'award' in message, but has operation: 'score'
+    const sdkScoreError = new Error('PERMISSION_DENIED')
+    ;(sdkScoreError as any).operation = 'score'
+    mockAdjudicateGuess.mockRejectedValue(sdkScoreError)
+
+    const roomSnapshot = {
+      ...baseRoom,
+      status: 'drawing' as const,
+      game: {
+        ...baseRoom.game,
+        turnId: 'turn-0',
+        drawerId: 'user-1',
+      },
+      players: {
+        'user-1': { id: 'user-1', name: 'Drawer', score: 0, connected: true },
+        'guest-1': { id: 'guest-1', name: 'Alice', score: 0, connected: true },
+      },
+    }
+
+    mockGetRoom.mockResolvedValueOnce(roomSnapshot)
+    const { result } = renderHook(() => useRoomGame('AB12CD', 'user-1'))
+    await waitFor(() => expect(result.current.loading).toBe(false))
+
+    act(() => {
+      roomSnapshotCallback!(roomSnapshot)
+    })
+
+    await waitFor(() => {
+      expect(playerGuessCallbacks['turn-0_guest-1']).toBeDefined()
+    })
+
+    act(() => {
+      playerGuessCallbacks['turn-0_guest-1']('word')
+    })
+
+    await waitFor(
+      () => {
+        // Correctly labeled as score failure despite generic PERMISSION_DENIED message!
+        expect(result.current.warning).toBe('Failed to score guess for Alice: PERMISSION_DENIED')
+      },
+      { timeout: 3500 }
+    )
   })
 })

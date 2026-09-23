@@ -110,9 +110,9 @@ export function DrawingCanvas({
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, width, height)
 
-    // Sort by createdAt or push id to maintain deterministic order
+    // Sort by createdAt or push id to maintain deterministic order (code-unit comparison)
     const sorted = [...strokeList].sort(
-      (a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0) || a.id.localeCompare(b.id)
+      (a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
     )
 
     // Clear marker: find last clear stroke and only render strokes after it

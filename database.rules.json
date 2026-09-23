@@ -135,7 +135,49 @@
         "$turnId": {
           "$playerId": {
             ".read": "auth != null && auth.uid === root.child('rooms').child($roomId).child('game').child('drawerId').val()",
-            ".write": "auth != null && auth.uid === $playerId && !root.child('rooms').child($roomId).child('game').child('correctGuesserIds').child($turnId).child($playerId).exists() && $turnId === root.child('rooms').child($roomId).child('game').child('turnId').val() && root.child('rooms').child($roomId).child('players').child(auth.uid).exists() && root.child('rooms').child($roomId).child('game').child('drawerId').val() !== auth.uid && root.child('rooms').child($roomId).child('status').val() === 'drawing' && now < root.child('rooms').child($roomId).child('game').child('phaseEndsAt').val()"
+            "text": {
+              ".write": "auth != null && auth.uid === $playerId && !root.child('rooms').child($roomId).child('game').child('correctGuesserIds').child($turnId).child($playerId).exists() && $turnId === root.child('rooms').child($roomId).child('game').child('turnId').val() && root.child('rooms').child($roomId).child('players').child(auth.uid).exists() && root.child('rooms').child($roomId).child('game').child('drawerId').val() !== auth.uid && root.child('rooms').child($roomId).child('status').val() === 'drawing' && now < root.child('rooms').child($roomId).child('game').child('phaseEndsAt').val() && newData.exists()",
+              ".validate": "newData.isString() && newData.val().length >= 1 && newData.val().length <= 100"
+            },
+            "submittedAt": {
+              ".write": "auth != null && auth.uid === $playerId && !root.child('rooms').child($roomId).child('game').child('correctGuesserIds').child($turnId).child($playerId).exists() && $turnId === root.child('rooms').child($roomId).child('game').child('turnId').val() && root.child('rooms').child($roomId).child('players').child(auth.uid).exists() && root.child('rooms').child($roomId).child('game').child('drawerId').val() !== auth.uid && root.child('rooms').child($roomId).child('status').val() === 'drawing' && now < root.child('rooms').child($roomId).child('game').child('phaseEndsAt').val() && newData.exists()",
+              ".validate": "newData.isNumber()"
+            },
+            "attempts": {
+              "$attemptId": {
+                ".write": "auth != null && auth.uid === $playerId && !root.child('rooms').child($roomId).child('game').child('correctGuesserIds').child($turnId).child($playerId).exists() && $turnId === root.child('rooms').child($roomId).child('game').child('turnId').val() && root.child('rooms').child($roomId).child('players').child(auth.uid).exists() && root.child('rooms').child($roomId).child('game').child('drawerId').val() !== auth.uid && root.child('rooms').child($roomId).child('status').val() === 'drawing' && now < root.child('rooms').child($roomId).child('game').child('phaseEndsAt').val() && !data.exists() && newData.exists()",
+                ".validate": "newData.hasChildren(['id', 'text', 'createdAt']) && newData.child('id').val() === $attemptId && newData.child('text').isString() && newData.child('text').val().length >= 1 && newData.child('text').val().length <= 100 && newData.child('createdAt').isNumber()",
+                "id": { ".validate": "newData.val() === $attemptId" },
+                "text": { ".validate": "newData.isString() && newData.val().length >= 1 && newData.val().length <= 100" },
+                "createdAt": { ".validate": "newData.isNumber()" },
+                "$other": {
+                  ".validate": false
+                }
+              }
+            },
+            "$other": {
+              ".validate": false
+            }
+          }
+        }
+      }
+    },
+    "roomWrongGuesses": {
+      "$roomId": {
+        "$turnId": {
+          ".read": "auth != null && root.child('rooms').child($roomId).child('players').child(auth.uid).exists()",
+          "$guessId": {
+            ".write": "auth != null && auth.uid === root.child('rooms').child($roomId).child('game').child('drawerId').val() && $turnId === root.child('rooms').child($roomId).child('game').child('turnId').val() && (root.child('rooms').child($roomId).child('status').val() === 'drawing' || root.child('rooms').child($roomId).child('status').val() === 'results') && !data.exists()",
+            ".validate": "newData.hasChildren(['id', 'playerId', 'playerName', 'text', 'createdAt']) && newData.child('id').val() === $guessId && newData.child('playerId').isString() && root.child('rooms').child($roomId).child('players').child(newData.child('playerId').val()).exists() && root.child('rooms').child($roomId).child('game').child('drawerId').val() !== newData.child('playerId').val() && newData.child('playerName').isString() && newData.child('playerName').val().length <= 32 && newData.child('text').isString() && newData.child('text').val().length >= 1 && newData.child('text').val().length <= 100 && newData.child('createdAt').isNumber() && (!newData.child('attemptId').exists() || (root.child('roomGuesses').child($roomId).child($turnId).child(newData.child('playerId').val()).child('attempts').child(newData.child('attemptId').val()).child('text').val() === newData.child('text').val() && newData.child('id').val() === newData.child('playerId').val() + '_' + newData.child('attemptId').val()))",
+            "id": { ".validate": "newData.val() === $guessId" },
+            "playerId": { ".validate": "newData.isString()" },
+            "playerName": { ".validate": "newData.isString() && newData.val().length <= 32" },
+            "text": { ".validate": "newData.isString() && newData.val().length >= 1 && newData.val().length <= 100" },
+            "createdAt": { ".validate": "newData.isNumber()" },
+            "attemptId": { ".validate": "newData.isString() && newData.val().length <= 64" },
+            "$other": {
+              ".validate": false
+            }
           }
         }
       }

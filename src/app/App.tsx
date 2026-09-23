@@ -45,7 +45,11 @@ export function App() {
   const {
     room,
     error: roomError,
+    warning: gameWarning,
+    clearWarning,
+    retryPendingGuesses,
     roundSecret,
+    wrongGuesses,
     createRoom,
     joinRoom,
     startGame,
@@ -276,6 +280,10 @@ export function App() {
               currentUserId={userId!}
               serverTimeOffset={serverTimeOffset}
               roundSecret={roundSecret}
+              wrongGuesses={wrongGuesses}
+              warning={gameWarning}
+              onClearWarning={clearWarning}
+              onRetry={retryPendingGuesses}
               onChooseWord={chooseWord}
               onAppendStroke={appendStroke}
               onClearCanvas={clearCanvas}

@@ -460,6 +460,12 @@ body {
   color: var(--color-coral);
 }
 
+.alert-banner-warning {
+  background-color: rgba(250, 204, 21, 0.15);
+  border: 1px solid var(--color-yellow);
+  color: var(--color-yellow);
+}
+
 .btn-dismiss {
   background: none;
   border: none;

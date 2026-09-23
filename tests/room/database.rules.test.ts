@@ -1073,4 +1073,265 @@ describe('Realtime Database room rules', () => {
     expect(finalRoom.status).toBe('results')
     expect(finalRoom.game.revealedAnswer?.text).toBe('cat')
   })
+
+  it('enforces shared wrong-guess permissions: members read, outsiders cannot, only drawer publishes, and correct text stays secret', async () => {
+    await repositoryFor('host').createRoom(room())
+    await repositoryFor('guest-1').joinRoom(roomId, player('guest-1'))
+    await repositoryFor('guest-2').joinRoom(roomId, player('guest-2'))
+    await repositoryFor('host').startGame(roomId, 'host', [word])
+    const r = (await repositoryFor('host').getRoom(roomId))!
+    const drawerId = r.game.drawerId!
+    const [guesser1, guesser2] = ['host', 'guest-1', 'guest-2'].filter((id) => id !== drawerId)
+    const turnId = r.game.turnId!
+    await repositoryFor(drawerId).chooseWord(roomId, drawerId, word)
+
+    // Outsider cannot read or write to roomWrongGuesses
+    await assertFails(get(ref(databaseFor('outsider'), `roomWrongGuesses/${roomId}/${turnId}`)))
+    await assertFails(set(ref(databaseFor('outsider'), `roomWrongGuesses/${roomId}/${turnId}/outsider_1`), {
+      id: 'outsider_1',
+      playerId: 'outsider',
+      playerName: 'Outsider',
+      text: 'wrong',
+      createdAt: 100,
+    }))
+
+    // Non-drawer member cannot write to roomWrongGuesses
+    await assertFails(set(ref(databaseFor(guesser1), `roomWrongGuesses/${roomId}/${turnId}/g1_1`), {
+      id: 'g1_1',
+      playerId: guesser1,
+      playerName: guesser1,
+      text: 'wrong',
+      createdAt: 100,
+    }))
+
+    // Guesser1 sends a wrong guess
+    await repositoryFor(guesser1).sendGuess(roomId, guesser1, 'elephant')
+
+    // Authorized drawer adjudicates the wrong guess -> publishes to roomWrongGuesses
+    const adjudicatedWrong = await repositoryFor(drawerId).adjudicateGuess(roomId, guesser1)
+    expect(adjudicatedWrong).toBe(false)
+
+    // Members (guesser1, guesser2, drawer) can read published wrong guesses
+    const memberReadSnap = await assertSucceeds(get(ref(databaseFor(guesser2), `roomWrongGuesses/${roomId}/${turnId}`)))
+    const publishedGuesses = memberReadSnap.val()
+    expect(publishedGuesses).toBeTruthy()
+    const guessEntries = Object.values(publishedGuesses as Record<string, { text: string; playerId: string }>)
+    expect(guessEntries.some((g) => g.text === 'elephant' && g.playerId === guesser1)).toBe(true)
+
+    // Drawer adjudicates correct guess
+    await repositoryFor(guesser1).sendGuess(roomId, guesser1, 'cat')
+    const adjudicatedCorrect = await repositoryFor(drawerId).adjudicateGuess(roomId, guesser1)
+    expect(adjudicatedCorrect).toBe(true)
+
+    // Verify correct word 'cat' is NEVER present on the public wrong guesses feed
+    const postCorrectSnap = await assertSucceeds(get(ref(databaseFor(guesser2), `roomWrongGuesses/${roomId}/${turnId}`)))
+    const postGuesses = Object.values((postCorrectSnap.val() || {}) as Record<string, { text: string }>)
+    expect(postGuesses.some((g) => g.text === 'cat')).toBe(false)
+
+    // Drawer cannot overwrite already published wrong guess (!data.exists())
+    const existingKey = Object.keys(publishedGuesses as object)[0]
+    await assertFails(set(ref(databaseFor(drawerId), `roomWrongGuesses/${roomId}/${turnId}/${existingKey}`), {
+      id: existingKey,
+      playerId: guesser1,
+      playerName: guesser1,
+      text: 'tampered',
+      createdAt: 200,
+    }))
+  })
+
+  it('supports multiple rapid wrong attempts in order and enforces turn isolation for wrong guesses', async () => {
+    await repositoryFor('host').createRoom(room())
+    await repositoryFor('guest-1').joinRoom(roomId, player('guest-1'))
+    await repositoryFor('guest-2').joinRoom(roomId, player('guest-2'))
+    await repositoryFor('host').startGame(roomId, 'host', [word])
+    const r = (await repositoryFor('host').getRoom(roomId))!
+    const drawerId = r.game.drawerId!
+    const guesser1 = ['host', 'guest-1', 'guest-2'].find((id) => id !== drawerId)!
+    const turnId = r.game.turnId!
+    await repositoryFor(drawerId).chooseWord(roomId, drawerId, word)
+
+    // Rapid wrong attempts without waiting for drawer adjudication in between
+    await repositoryFor(guesser1).sendGuess(roomId, guesser1, 'zebra')
+    await repositoryFor(guesser1).sendGuess(roomId, guesser1, 'giraffe')
+
+    // Drawer adjudicates and publishes both
+    await repositoryFor(drawerId).adjudicateGuess(roomId, guesser1)
+
+    const turn0Snap = await assertSucceeds(get(ref(databaseFor(guesser1), `roomWrongGuesses/${roomId}/${turnId}`)))
+    const turn0Guesses = Object.values((turn0Snap.val() || {}) as Record<string, { text: string }>)
+    expect(turn0Guesses).toHaveLength(2)
+    expect(turn0Guesses.map((g) => g.text)).toEqual(['zebra', 'giraffe'])
+
+    // Complete the turn by having all connected guessers solve the word
+    const allGuessers = ['host', 'guest-1', 'guest-2'].filter((id) => id !== drawerId)
+    for (const gid of allGuessers) {
+      await repositoryFor(gid).sendGuess(roomId, gid, 'cat')
+      await repositoryFor(drawerId).adjudicateGuess(roomId, gid)
+    }
+
+    // Advance to next round / turn
+    await repositoryFor('host').advanceRound(roomId, 'host', [word])
+    const nextRoom = (await repositoryFor('host').getRoom(roomId))!
+    const nextTurnId = nextRoom.game.turnId!
+    expect(nextTurnId).not.toBe(turnId)
+
+    // Next turn has no wrong guesses from previous turn
+    const turn1Snap = await assertSucceeds(get(ref(databaseFor(guesser1), `roomWrongGuesses/${roomId}/${nextTurnId}`)))
+    expect(turn1Snap.val()).toBeNull()
+
+    // Drawer cannot publish to stale previous turnId
+    await assertFails(set(ref(databaseFor(drawerId), `roomWrongGuesses/${roomId}/${turnId}/stale_guess`), {
+      id: 'stale_guess',
+      playerId: guesser1,
+      playerName: guesser1,
+      text: 'stale',
+      createdAt: 300,
+    }))
+  })
+
+  it('enforces strict payload validation: requires numeric timestamps, rejects unknown fields, verifies attempt correspondence, and permits wrong guess recovery during results', async () => {
+    const customRoom = {
+      ...room(),
+      settings: { language: 'english' as const, drawSeconds: 1, rounds: 1, maxPlayers: 10 },
+    }
+    await repositoryFor('host').createRoom(customRoom)
+    await repositoryFor('guest-1').joinRoom(roomId, player('guest-1'))
+    await repositoryFor('guest-2').joinRoom(roomId, player('guest-2'))
+    await repositoryFor('host').startGame(roomId, 'host', [word])
+    const r = (await repositoryFor('host').getRoom(roomId))!
+    const drawerId = r.game.drawerId!
+    const guesser1 = ['host', 'guest-1', 'guest-2'].find((id) => id !== drawerId)!
+    const turnId = r.game.turnId!
+    await repositoryFor(drawerId).chooseWord(roomId, drawerId, word)
+
+    // 1. Private attempt validation: reject non-numeric timestamp
+    await assertFails(set(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}/attempts/att-bad-time`), {
+      id: 'att-bad-time',
+      text: 'zebra',
+      createdAt: '1000' as any,
+    }))
+
+    // 2. Private attempt validation: reject extra unknown fields
+    await assertFails(set(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}/attempts/att-extra`), {
+      id: 'att-extra',
+      text: 'zebra',
+      createdAt: 1000,
+      extraField: 'malicious',
+    }))
+
+    // 3. Valid private attempts append atomically via update (matching sendGuess)
+    await assertSucceeds(update(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}`), {
+      text: 'zebra',
+      submittedAt: 1000,
+      'attempts/att-valid': {
+        id: 'att-valid',
+        text: 'zebra',
+        createdAt: 1000,
+      },
+    }))
+    await assertSucceeds(update(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}`), {
+      text: 'banana',
+      submittedAt: 1500,
+      'attempts/att-banana': {
+        id: 'att-banana',
+        text: 'banana',
+        createdAt: 1500,
+      },
+    }))
+
+    // 3b. Regression: Private attempt records are immutable; direct edit of existing attempt must fail
+    await assertFails(set(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}/attempts/att-valid`), {
+      id: 'att-valid',
+      text: 'cat', // attempted edit from wrong word 'zebra' to correct answer 'cat'
+      createdAt: 1000,
+    }))
+    await assertFails(update(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}/attempts/att-valid`), {
+      text: 'cat',
+    }))
+
+    // 3c. Deleting existing attempt must fail
+    await assertFails(set(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}/attempts/att-valid`), null))
+    await assertFails(update(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}`), {
+      'attempts/att-valid': null,
+    }))
+
+    // 3d. Parent replacement and deletion must fail (no broad parent write grant)
+    await assertFails(set(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}`), null))
+    await assertFails(set(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}/attempts`), null))
+    await assertFails(update(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}`), {
+      attempts: null,
+    }))
+    await assertFails(set(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}`), {
+      text: 'cat',
+      submittedAt: 2000,
+    }))
+    await assertFails(set(ref(databaseFor(guesser1), `roomGuesses/${roomId}/${turnId}/${guesser1}/attempts`), {
+      'att-hacked': { id: 'att-hacked', text: 'cat', createdAt: 2000 },
+    }))
+
+    // 4. Public wrong guess: reject non-numeric timestamp
+    await assertFails(set(ref(databaseFor(drawerId), `roomWrongGuesses/${roomId}/${turnId}/${guesser1}_att-bad-time`), {
+      id: `${guesser1}_att-bad-time`,
+      playerId: guesser1,
+      playerName: guesser1,
+      text: 'zebra',
+      createdAt: '1000' as any,
+    }))
+
+    // 5. Public wrong guess: reject extra unknown fields
+    await assertFails(set(ref(databaseFor(drawerId), `roomWrongGuesses/${roomId}/${turnId}/${guesser1}_att-extra`), {
+      id: `${guesser1}_att-extra`,
+      playerId: guesser1,
+      playerName: guesser1,
+      text: 'zebra',
+      createdAt: 1000,
+      extraField: 'not_allowed',
+    }))
+
+    // 6. Public wrong guess: reject forged text when attemptId is provided
+    await assertFails(set(ref(databaseFor(drawerId), `roomWrongGuesses/${roomId}/${turnId}/${guesser1}_att-valid`), {
+      id: `${guesser1}_att-valid`,
+      playerId: guesser1,
+      playerName: guesser1,
+      text: 'forged_word',
+      createdAt: 1000,
+      attemptId: 'att-valid',
+    }))
+
+    // 7. Valid public wrong guess matching private attempt succeeds
+    await assertSucceeds(set(ref(databaseFor(drawerId), `roomWrongGuesses/${roomId}/${turnId}/${guesser1}_att-valid`), {
+      id: `${guesser1}_att-valid`,
+      playerId: guesser1,
+      playerName: guesser1,
+      text: 'zebra',
+      createdAt: 1000,
+      attemptId: 'att-valid',
+    }))
+
+    // 8. Transition to results via timeout
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    await repositoryFor(drawerId).finishDrawing(roomId, drawerId)
+    const resultsRoom = (await repositoryFor('host').getRoom(roomId))!
+    expect(resultsRoom.status).toBe('results')
+    expect(resultsRoom.game.turnId).toBe(turnId)
+
+    // 9. Drawer can recover pending wrong guess during results phase for the same turn!
+    await assertSucceeds(set(ref(databaseFor(drawerId), `roomWrongGuesses/${roomId}/${turnId}/${guesser1}_att-banana`), {
+      id: `${guesser1}_att-banana`,
+      playerId: guesser1,
+      playerName: guesser1,
+      text: 'banana',
+      createdAt: 1500,
+      attemptId: 'att-banana',
+    }))
+
+    // 10. Non-drawer cannot write during results
+    await assertFails(set(ref(databaseFor(guesser1), `roomWrongGuesses/${roomId}/${turnId}/${guesser1}_non_drawer`), {
+      id: `${guesser1}_non_drawer`,
+      playerId: guesser1,
+      playerName: guesser1,
+      text: 'banana',
+      createdAt: 1600,
+    }))
+  })
 })

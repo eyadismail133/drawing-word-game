@@ -1,5 +1,6 @@
-import { useState, useRef, useEffect, type FormEvent, type KeyboardEvent } from 'react'
+import { useState, useRef, useEffect, useMemo, type FormEvent, type KeyboardEvent } from 'react'
 import type { Player } from '../features/game/domain'
+import type { WrongGuess } from '../features/room/repository'
 import { AvatarGraphic } from './AvatarGraphic'
 
 export type ChatMessage = {
@@ -21,6 +22,8 @@ export type GuessChatProps = {
   correctGuesserIds?: Record<string, true>
   disabled?: boolean
   expectedScore?: number
+  wrongGuesses?: WrongGuess[]
+  turnId?: string
 }
 
 export function GuessChat({
@@ -32,40 +35,82 @@ export function GuessChat({
   correctGuesserIds = {},
   disabled = false,
   expectedScore,
+  wrongGuesses = [],
+  turnId,
 }: GuessChatProps) {
   const [guessInput, setGuessInput] = useState<string>('')
-  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [systemMessages, setSystemMessages] = useState<ChatMessage[]>([])
   const [isSending, setIsSending] = useState<boolean>(false)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
+  const prevTurnIdRef = useRef<string | undefined>(turnId)
   const prevCorrectIdsRef = useRef<Set<string>>(new Set())
 
   const playerMap: Record<string, Player> = Array.isArray(players)
     ? Object.fromEntries(players.map((p) => [p.id, p]))
     : players
 
-  // Announce when other players guess correctly without revealing their text
+  // Announce when players guess correctly without revealing their text, turn-isolated
   useEffect(() => {
+    let isNewTurn = false
+    if (prevTurnIdRef.current !== turnId) {
+      prevTurnIdRef.current = turnId
+      prevCorrectIdsRef.current = new Set()
+      isNewTurn = true
+    }
+
     const currentIds = new Set(Object.keys(correctGuesserIds))
+    const newAnnouncements: ChatMessage[] = []
     for (const id of currentIds) {
       if (!prevCorrectIdsRef.current.has(id)) {
         const playerName = playerMap[id]?.name || 'A player'
         const isSelf = id === currentUserId
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `correct-${id}-${Date.now()}`,
-            senderId: id,
-            senderName: playerName,
-            text: isSelf ? 'You guessed the word!' : `${playerName} guessed the word!`,
-            isSystem: true,
-            isCorrect: true,
-            timestamp: Date.now(),
-          },
-        ])
+        newAnnouncements.push({
+          id: `correct-${turnId ?? 'turn'}-${id}`,
+          senderId: id,
+          senderName: playerName,
+          text: isSelf ? 'You guessed the word!' : `${playerName} guessed the word!`,
+          isSystem: true,
+          isCorrect: true,
+          timestamp: Date.now(),
+        })
       }
     }
+
+    if (isNewTurn) {
+      setSystemMessages(newAnnouncements)
+    } else if (newAnnouncements.length > 0) {
+      setSystemMessages((prev) => [...prev, ...newAnnouncements])
+    }
     prevCorrectIdsRef.current = currentIds
-  }, [correctGuesserIds, playerMap, currentUserId])
+  }, [turnId, correctGuesserIds, playerMap, currentUserId])
+
+  // Derive chat messages from published wrong guesses
+  const wrongChatMessages: ChatMessage[] = useMemo(() => {
+    if (!wrongGuesses || wrongGuesses.length === 0) return []
+    return wrongGuesses.map((wg) => ({
+      id: wg.id,
+      senderId: wg.playerId,
+      senderName: wg.playerName || playerMap[wg.playerId]?.name || 'Player',
+      text: wg.text,
+      isSystem: false,
+      isCorrect: false,
+      timestamp: wg.createdAt,
+    }))
+  }, [wrongGuesses, playerMap])
+
+  // Combine system announcements and published wrong guesses with deterministic deduplication
+  const messages: ChatMessage[] = useMemo(() => {
+    const combined = [...systemMessages, ...wrongChatMessages]
+    const seen = new Set<string>()
+    const deduped: ChatMessage[] = []
+    for (const msg of combined) {
+      if (!seen.has(msg.id)) {
+        seen.add(msg.id)
+        deduped.push(msg)
+      }
+    }
+    return deduped.sort((a, b) => a.timestamp - b.timestamp)
+  }, [systemMessages, wrongChatMessages])
 
   // Scroll to bottom of chat on new message
   useEffect(() => {
@@ -82,22 +127,14 @@ export function GuessChat({
     setGuessInput('')
     setIsSending(true)
 
-    // Append local message for this guesser so they see their own attempt
-    const myName = playerMap[currentUserId]?.name || 'You'
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `guess-${Date.now()}`,
-        senderId: currentUserId,
-        senderName: myName,
-        text: trimmed,
-        isSystem: false,
-        timestamp: Date.now(),
-      },
-    ])
-
     try {
-      await onSendGuess(trimmed)
+      const res = await onSendGuess(trimmed)
+      if (res === false) {
+        setGuessInput(trimmed)
+      }
+    } catch {
+      // Restore input and avoid leaving false public messages
+      setGuessInput(trimmed)
     } finally {
       setIsSending(false)
     }

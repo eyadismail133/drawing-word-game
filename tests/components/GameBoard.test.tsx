@@ -308,6 +308,103 @@ describe('GameBoard component', () => {
       const p3Input = screen.getByLabelText(/guess word/i)
       expect(p3Input).not.toBeDisabled()
     })
+
+    it('renders remote wrong guesses and preserves secrecy of correct words', () => {
+      const wrongGuesses = [
+        {
+          id: 'player-2_att1',
+          playerId: 'player-2',
+          playerName: 'Bob',
+          text: 'elephant',
+          createdAt: 1000,
+        },
+        {
+          id: 'player-3_att1',
+          playerId: 'player-3',
+          playerName: 'Charlie',
+          text: 'giraffe',
+          createdAt: 1001,
+        },
+      ]
+
+      render(
+        <GameBoard
+          room={baseRoom}
+          currentUserId="host-1"
+          wrongGuesses={wrongGuesses}
+        />
+      )
+
+      // Active drawer sees remote wrong guesses
+      expect(screen.getByText('Bob:')).toBeInTheDocument()
+      expect(screen.getByText('elephant')).toBeInTheDocument()
+      expect(screen.getByText('Charlie:')).toBeInTheDocument()
+      expect(screen.getByText('giraffe')).toBeInTheDocument()
+
+      // The secret answer word ('cat') is NOT rendered as a wrong guess message
+      expect(screen.queryByText(/cat/i, { selector: '.message-content' })).not.toBeInTheDocument()
+    })
+
+    it('displays author wrong guess once without duplicate when published feed updates', () => {
+      const wrongGuesses = [
+        {
+          id: 'player-2_att1',
+          playerId: 'player-2',
+          playerName: 'Bob',
+          text: 'table',
+          createdAt: 1000,
+        },
+      ]
+
+      const { rerender } = render(
+        <GameBoard
+          room={baseRoom}
+          currentUserId="player-2"
+          wrongGuesses={wrongGuesses}
+        />
+      )
+
+      // Author sees their own wrong guess once
+      expect(screen.getAllByText('table')).toHaveLength(1)
+
+      // Rerender with repeated listener / reconnect update
+      rerender(
+        <GameBoard
+          room={baseRoom}
+          currentUserId="player-2"
+          wrongGuesses={[...wrongGuesses]}
+        />
+      )
+
+      expect(screen.getAllByText('table')).toHaveLength(1)
+    })
+
+    it('surfaces error and does not leave a false public-looking message when submission fails', async () => {
+      const mockSendGuess = vi.fn().mockRejectedValue(new Error('Network error: submission failed'))
+      render(
+        <GameBoard
+          room={baseRoom}
+          currentUserId="player-2"
+          onSendGuess={mockSendGuess}
+        />
+      )
+
+      const input = screen.getByLabelText(/guess word/i)
+      const submitBtn = screen.getByRole('button', { name: /submit guess/i })
+
+      fireEvent.change(input, { target: { value: 'failedword' } })
+
+      await act(async () => {
+        fireEvent.click(submitBtn)
+      })
+
+      // Failed submission should surface an error
+      expect(screen.getByRole('alert')).toBeInTheDocument()
+      expect(screen.getByText(/Network error: submission failed/i)).toBeInTheDocument()
+
+      // Should not leave a false public-looking message in the messages log
+      expect(screen.queryByText('failedword', { selector: '.message-content' })).not.toBeInTheDocument()
+    })
   })
 
   describe('Canvas Stroke Normalization and Replay', () => {

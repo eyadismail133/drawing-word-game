@@ -5,6 +5,9 @@ import type { Room } from '../../src/features/room/types'
 
 let currentRoom: Room | null = null
 let currentAuthUserId: string | null = 'user-1'
+let currentError: Error | null = null
+let currentWarning: string | null = null
+const mockClearWarning = vi.fn()
 
 vi.mock('../../src/features/auth/useAnonymousAuth', () => ({
   useAnonymousAuth: () => ({
@@ -28,8 +31,11 @@ vi.mock('../../src/features/game/useRoomGame', () => ({
   useRoomGame: () => ({
     room: currentRoom,
     loading: false,
-    error: null,
+    error: currentError,
+    warning: currentWarning,
+    clearWarning: mockClearWarning,
     roundSecret: null,
+    wrongGuesses: [],
     createRoom: vi.fn(),
     joinRoom: vi.fn(),
     startGame: vi.fn(),
@@ -84,6 +90,8 @@ describe('App GameBoard integration', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     currentAuthUserId = 'user-1'
+    currentError = null
+    currentWarning = null
   })
 
   it('renders GameBoard instead of placeholder card during choosing status', () => {
@@ -126,6 +134,46 @@ describe('App GameBoard integration', () => {
     expect(screen.queryByText('Game in Progress')).not.toBeInTheDocument()
     expect(screen.getByRole('region', { name: /game board/i })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: /round results/i })).toBeInTheDocument()
+  })
+
+  it('displays in-game nonfatal warning on GameBoard without unmounting GameBoard', () => {
+    currentRoom = {
+      ...activeRoom,
+      status: 'drawing',
+      game: {
+        ...activeRoom.game,
+        answer: { id: 'en-1', text: 'cat', language: 'english' },
+        phaseEndsAt: Date.now() + 60_000,
+      },
+    }
+    currentWarning = 'Failed to publish wrong guess: network glitch'
+    render(<App />)
+
+    // GameBoard remains mounted and interactive
+    expect(screen.getByRole('region', { name: /game board/i })).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: /drawing canvas/i })).toBeInTheDocument()
+    // Warning banner is displayed inside GameBoard
+    expect(screen.getByRole('alert')).toHaveTextContent('Failed to publish wrong guess: network glitch')
+    // Fatal full-screen Room Error is NOT shown
+    expect(screen.queryByText('Room Error')).not.toBeInTheDocument()
+  })
+
+  it('unmounts GameBoard and renders full-screen Room Error card only on fatal roomError', () => {
+    currentRoom = {
+      ...activeRoom,
+      status: 'drawing',
+      game: {
+        ...activeRoom.game,
+        answer: { id: 'en-1', text: 'cat', language: 'english' },
+        phaseEndsAt: Date.now() + 60_000,
+      },
+    }
+    currentError = new Error('Fatal connection refused')
+    render(<App />)
+
+    expect(screen.getByText('Room Error')).toBeInTheDocument()
+    expect(screen.getByText('Fatal connection refused')).toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: /game board/i })).not.toBeInTheDocument()
   })
 
   it('renders GameBoard during finished status', () => {

@@ -7,6 +7,7 @@ import {
   type Word,
 } from '../features/game/domain'
 import type { Room, Stroke } from '../features/room/types'
+import type { WrongGuess } from '../features/room/repository'
 import { DrawingCanvas } from './DrawingCanvas'
 import { GuessChat } from './GuessChat'
 import { WordPicker } from './WordPicker'
@@ -17,6 +18,10 @@ export type GameBoardProps = {
   currentUserId: string
   serverTimeOffset?: number
   roundSecret?: { answer: Word | null; choices: Word[] } | null
+  wrongGuesses?: WrongGuess[]
+  warning?: string | null
+  onClearWarning?: () => void
+  onRetry?: () => void
   onChooseWord?: (word: Word) => Promise<void> | void
   onAppendStroke?: (stroke: Omit<Stroke, 'id' | 'createdAt'>) => Promise<string> | void
   onClearCanvas?: () => Promise<string | void> | void
@@ -33,6 +38,10 @@ export function GameBoard({
   currentUserId,
   serverTimeOffset = 0,
   roundSecret = null,
+  wrongGuesses = [],
+  warning = null,
+  onClearWarning,
+  onRetry,
   onChooseWord,
   onAppendStroke,
   onClearCanvas,
@@ -196,7 +205,9 @@ export function GameBoard({
     try {
       await onSendGuess?.(text)
     } catch (err) {
-      setActionError(err instanceof Error ? err : new Error('Failed to submit guess'))
+      const errorObj = err instanceof Error ? err : new Error('Failed to submit guess')
+      setActionError(errorObj)
+      throw errorObj
     }
   }
 
@@ -337,6 +348,35 @@ export function GameBoard({
           </button>
         </div>
       </header>
+
+      {warning && (
+        <div className="alert-banner alert-banner-warning mb-3" role="alert">
+          <span>{warning}</span>
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', marginLeft: 'auto' }}>
+            {onRetry && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                onClick={onRetry}
+                style={{ padding: '2px 8px', fontSize: '0.8rem' }}
+                aria-label="Retry"
+              >
+                Retry
+              </button>
+            )}
+            {onClearWarning && (
+              <button
+                type="button"
+                className="btn-dismiss"
+                onClick={onClearWarning}
+                aria-label="Dismiss warning"
+              >
+                &times;
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {actionError && (
         <div className="alert-banner alert-banner-error mb-3" role="alert">
@@ -575,6 +615,8 @@ export function GameBoard({
               correctGuesserIds={correctGuesserIds}
               disabled={room.status !== 'drawing'}
               expectedScore={expectedScore}
+              wrongGuesses={wrongGuesses}
+              turnId={turnId}
             />
           </div>
         </aside>

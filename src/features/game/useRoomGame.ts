@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { onValue, ref, type Database } from 'firebase/database'
 import { chooseWords, getProgressiveWordHint, type Word } from './domain'
 import { ALL_WORDS } from './words'
-import { createRoomRepository } from '../room/repository'
+import { createRoomRepository, type WrongGuess } from '../room/repository'
 import type { Room, RoomSettings, Stroke } from '../room/types'
 import type { Avatar } from '../avatar/avatar'
 import { getDeterministicAvatar } from '../avatar/avatar'
@@ -25,8 +25,10 @@ export type UseRoomGameReturn = {
   room: Room | null
   loading: boolean
   error: Error | null
+  warning?: string | null
   roundSecret: RoundSecret | null
   serverTimeOffset: number
+  wrongGuesses: WrongGuess[]
   createRoom: (name: string, settings: RoomSettings, avatar?: Avatar) => Promise<Room>
   joinRoom: (roomId: string, name: string, avatar?: Avatar) => Promise<boolean>
   startGame: () => Promise<void>
@@ -34,6 +36,8 @@ export type UseRoomGameReturn = {
   leaveRoom: () => Promise<void>
   retry: () => void
   clearError: () => void
+  clearWarning?: () => void
+  retryPendingGuesses?: () => Promise<void>
   chooseWord: (word: Word) => Promise<void>
   appendStroke: (stroke: Omit<Stroke, 'id' | 'createdAt'>) => Promise<string>
   clearCanvas: () => Promise<string>
@@ -60,9 +64,19 @@ export function useRoomGame(
   const [room, setRoom] = useState<Room | null>(null)
   const [loading, setLoading] = useState<boolean>(Boolean(roomId))
   const [error, setError] = useState<Error | null>(null)
+  const [warning, setWarning] = useState<string | null>(null)
   const [attempt, setAttempt] = useState<number>(0)
   const [roundSecret, setRoundSecret] = useState<RoundSecret | null>(null)
   const [serverTimeOffset, setServerTimeOffset] = useState<number>(0)
+  const [wrongGuessesFeed, setWrongGuessesFeed] = useState<{
+    roomId: string | null
+    turnId: string | null
+    guesses: WrongGuess[]
+  }>({
+    roomId: null,
+    turnId: null,
+    guesses: [],
+  })
 
   const memberRoomIdRef = useRef<string | null>(null)
   const presenceRoomIdRef = useRef<string | null>(null)
@@ -77,6 +91,102 @@ export function useRoomGame(
   // Scope active room state strictly to the active roomId
   const activeRoom = room && room.id === roomId ? room : null
   const isMember = Boolean(roomId && userId && activeRoom?.players?.[userId])
+
+  const currentTurnId = activeRoom?.game.turnId ?? null
+
+  interface AdjudicationFailure {
+    roomId: string
+    turnId: string
+    guesserId: string
+    guesserName: string
+    type: 'score' | 'publication'
+    message: string
+  }
+
+  const pendingFailuresRef = useRef<Map<string, AdjudicationFailure>>(new Map())
+
+  const syncWarning = useCallback(() => {
+    const turnId = activeRoom?.game.turnId
+    if (!roomId || !turnId) {
+      setWarning(null)
+      return
+    }
+    const activeFailures = Array.from(pendingFailuresRef.current.values()).filter(
+      (f) => f.roomId === roomId && f.turnId === turnId
+    )
+    if (activeFailures.length === 0) {
+      setWarning(null)
+    } else {
+      const latest = activeFailures[activeFailures.length - 1]
+      const action = latest.type === 'score' ? 'score guess for' : 'publish wrong guess from'
+      setWarning(`Failed to ${action} ${latest.guesserName}: ${latest.message}`)
+    }
+  }, [roomId, activeRoom?.game.turnId])
+
+  // Clear nonfatal warning and pending failures automatically when turn changes
+  const prevTurnIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (currentTurnId !== prevTurnIdRef.current) {
+      prevTurnIdRef.current = currentTurnId
+      pendingFailuresRef.current.clear()
+      setWarning(null)
+    }
+  }, [currentTurnId])
+
+  const clearWarning = useCallback(() => {
+    setWarning(null)
+  }, [])
+
+  const retryPendingGuesses = useCallback(async (): Promise<void> => {
+    if (!roomId || !userId || !activeRoom || activeRoom.game.drawerId !== userId || !activeRoom.game.turnId) {
+      return
+    }
+    const turnId = activeRoom.game.turnId
+    const db = await loadDatabase()
+    const repository = createRoomRepository(db)
+
+    const failuresToRetry = Array.from(pendingFailuresRef.current.values()).filter(
+      (f) => f.roomId === roomId && f.turnId === turnId
+    )
+
+    for (const failure of failuresToRetry) {
+      const failureKey = `${roomId}_${turnId}_${failure.guesserId}`
+      try {
+        await repository.adjudicateGuess(roomId, failure.guesserId)
+        pendingFailuresRef.current.delete(failureKey)
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        const op = (err as any)?.operation
+        const isScore = op ? op === 'score' : /score|award/i.test(errMsg)
+        failure.type = isScore ? 'score' : 'publication'
+        failure.message = errMsg
+      }
+    }
+    syncWarning()
+  }, [roomId, userId, activeRoom, syncWarning])
+
+  const retryPendingGuessesRef = useRef(retryPendingGuesses)
+  retryPendingGuessesRef.current = retryPendingGuesses
+
+  // Trigger retry of pending failures on transition to results
+  useEffect(() => {
+    if (activeRoom?.status === 'results' && activeRoom.game.drawerId === userId) {
+      retryPendingGuessesRef.current().catch(() => {})
+    }
+  }, [activeRoom?.status, activeRoom?.game.drawerId, userId])
+
+  const wrongGuesses = useMemo(() => {
+    if (
+      !roomId ||
+      !currentTurnId ||
+      (activeRoom?.status !== 'drawing' && activeRoom?.status !== 'results') ||
+      wrongGuessesFeed.roomId !== roomId ||
+      wrongGuessesFeed.turnId !== currentTurnId
+    ) {
+      return []
+    }
+    return wrongGuessesFeed.guesses
+  }, [roomId, currentTurnId, activeRoom?.status, wrongGuessesFeed])
 
   useEffect(() => {
     if (isMember && roomId) {
@@ -109,6 +219,7 @@ export function useRoomGame(
   const retry = useCallback(() => {
     setError(null)
     setRoundSecret(null)
+    setWrongGuessesFeed({ roomId: null, turnId: null, guesses: [] })
     lastPresenceRef.current = null
     presenceRoomIdRef.current = null
     pendingPresenceRoomIdRef.current = null
@@ -149,6 +260,10 @@ export function useRoomGame(
             if (!isSubscribed) return
             const isConnected = snapshot.val() === true
             if (isConnected) {
+              // Retry any pending guess adjudications when connectivity is restored
+              if (activeRoomIdRef.current) {
+                retryPendingGuessesRef.current().catch(() => {})
+              }
               const isPresenceAlreadySet =
                 presenceRoomIdRef.current === roomId && lastPresenceRef.current === true
               const isPresencePending = pendingPresenceRoomIdRef.current === roomId
@@ -223,6 +338,7 @@ export function useRoomGame(
     if (!roomId) {
       setRoom(null)
       setRoundSecret(null)
+      setWrongGuessesFeed({ roomId: null, turnId: null, guesses: [] })
       setLoading(false)
       setError(null)
       lastPresenceRef.current = null
@@ -545,13 +661,81 @@ export function useRoomGame(
     }
   }, [roomId, userId, activeRoom?.game.drawerId])
 
+  // Subscribe to published wrong guesses for room members during drawing and results
+  useEffect(() => {
+    if (
+      !roomId ||
+      !isMember ||
+      !activeRoom?.game.turnId ||
+      (activeRoom.status !== 'drawing' && activeRoom.status !== 'results')
+    ) {
+      setWrongGuessesFeed({ roomId: null, turnId: null, guesses: [] })
+      return
+    }
+
+    const currentRoomId = roomId
+    const currentTurnId = activeRoom.game.turnId
+    let isSubscribed = true
+    let unsubscribe: (() => void) | null = null
+
+    // Pre-emptively scope feed to new turn to never expose old turn data
+    setWrongGuessesFeed(prev => {
+      if (prev.roomId === currentRoomId && prev.turnId === currentTurnId) {
+        return prev
+      }
+      return { roomId: currentRoomId, turnId: currentTurnId, guesses: [] }
+    })
+
+    loadDatabase()
+      .then((db) => {
+        if (!isSubscribed) return
+        const repository = createRoomRepository(db)
+        if (typeof repository.subscribeToWrongGuesses === 'function') {
+          unsubscribe = repository.subscribeToWrongGuesses(
+            currentRoomId,
+            currentTurnId,
+            (guesses) => {
+              if (isSubscribed) {
+                setWrongGuessesFeed({
+                  roomId: currentRoomId,
+                  turnId: currentTurnId,
+                  guesses,
+                })
+              }
+            },
+            (subErr) => {
+              if (isSubscribed) {
+                // Subscription access failures remain fatal/visible to diagnose
+                setError(subErr instanceof Error ? subErr : new Error(String(subErr)))
+              }
+            }
+          )
+        }
+      })
+      .catch((err) => {
+        if (isSubscribed) {
+          setError(err instanceof Error ? err : new Error(String(err)))
+        }
+      })
+
+    return () => {
+      isSubscribed = false
+      if (unsubscribe) unsubscribe()
+    }
+  }, [
+    roomId,
+    isMember,
+    activeRoom?.status === 'drawing' || activeRoom?.status === 'results',
+    activeRoom?.game.turnId,
+  ])
+
   // Active drawer listens to guesses and adjudicates across all room members (reconciles on reconnect)
   useEffect(() => {
     if (
       !roomId ||
       !userId ||
       !activeRoom ||
-      activeRoom.status !== 'drawing' ||
+      (activeRoom.status !== 'drawing' && activeRoom.status !== 'results') ||
       activeRoom.game.drawerId !== userId ||
       !activeRoom.game.turnId
     ) {
@@ -560,6 +744,9 @@ export function useRoomGame(
 
     const turnId = activeRoom.game.turnId
     const unsubs: (() => void)[] = []
+    const pendingRetryTimeouts = new Set<ReturnType<typeof setTimeout>>()
+    const retryCounts = new Map<string, number>()
+    const MAX_RETRIES = 3
     let isSubscribed = true
 
     loadDatabase()
@@ -568,8 +755,51 @@ export function useRoomGame(
         const repository = createRoomRepository(db)
         if (typeof repository.subscribeToPlayerGuess !== 'function') return
 
-        // Cover all room members other than the drawer; reconnecting players will trigger adjudication
         const guesserIds = Object.keys(activeRoom.players).filter((id) => id !== userId)
+
+        const runAdjudication = (guesserId: string) => {
+          if (!isSubscribed) return
+
+          const failureKey = `${roomId}_${turnId}_${guesserId}`
+          const guesserName = activeRoom.players[guesserId]?.name || 'Player'
+
+          repository.adjudicateGuess(roomId, guesserId)
+            .then(() => {
+              if (!isSubscribed) return
+              retryCounts.delete(guesserId)
+              pendingFailuresRef.current.delete(failureKey)
+              syncWarning()
+            })
+            .catch((err) => {
+              if (!isSubscribed) return
+              const count = retryCounts.get(guesserId) || 0
+              if (count < MAX_RETRIES) {
+                retryCounts.set(guesserId, count + 1)
+                const delay = 300 * (count + 1)
+                const tId = setTimeout(() => {
+                  pendingRetryTimeouts.delete(tId)
+                  if (isSubscribed) {
+                    runAdjudication(guesserId)
+                  }
+                }, delay)
+                pendingRetryTimeouts.add(tId)
+              } else {
+                // Retries exhausted: record pending failure and update warning without unmounting GameBoard
+                const msg = err instanceof Error ? err.message : String(err)
+                const op = (err as any)?.operation
+                const isScore = op ? op === 'score' : /score|award/i.test(msg)
+                pendingFailuresRef.current.set(failureKey, {
+                  roomId,
+                  turnId,
+                  guesserId,
+                  guesserName,
+                  type: isScore ? 'score' : 'publication',
+                  message: msg,
+                })
+                syncWarning()
+              }
+            })
+        }
 
         for (const guesserId of guesserIds) {
           const unsub = repository.subscribeToPlayerGuess(
@@ -578,7 +808,7 @@ export function useRoomGame(
             guesserId,
             (guessText) => {
               if (!isSubscribed || !guessText) return
-              repository.adjudicateGuess(roomId, guesserId).catch(() => {})
+              runAdjudication(guesserId)
             }
           )
           unsubs.push(unsub)
@@ -588,12 +818,15 @@ export function useRoomGame(
 
     return () => {
       isSubscribed = false
-      unsubs.forEach((u) => u())
+      unsubs.forEach((u) => {
+        if (typeof u === 'function') u()
+      })
+      pendingRetryTimeouts.forEach((t) => clearTimeout(t))
     }
   }, [
     roomId,
     userId,
-    activeRoom?.status,
+    activeRoom?.status === 'drawing' || activeRoom?.status === 'results',
     activeRoom?.game.turnId,
     activeRoom?.game.drawerId,
     activeRoom?.players ? Object.keys(activeRoom.players).sort().join(',') : '',
@@ -775,8 +1008,12 @@ export function useRoomGame(
     room: activeRoom,
     loading,
     error,
+    warning,
+    clearWarning,
+    retryPendingGuesses,
     roundSecret,
     serverTimeOffset,
+    wrongGuesses,
     createRoom,
     joinRoom,
     startGame,
